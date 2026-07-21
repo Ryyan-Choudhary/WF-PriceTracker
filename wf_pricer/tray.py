@@ -1,4 +1,4 @@
-"""System tray icon: cyan diamond when idle, red while capture mode is on."""
+"""System tray icon: cyan diamond when idle, red while scan mode is on."""
 from __future__ import annotations
 
 from PIL import Image, ImageDraw

@@ -1,119 +1,159 @@
-"""Ties OCR, item matching, pricing, and annotation together into one pass
-over a folder of screenshots taken during a single capture session.
+"""Turns a screen crop into priced item(s).
+
+price_crop() is for single-item scans: OCR the crop, fuzzy-match the best
+line (or the whole crop's lines joined together, if the name wrapped) and
+price it.
+
+price_region() is for multi-select scans: OCR a larger region that may
+contain several different items' tiles, and price every one found.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable, Optional
 
 from PIL import Image
 
-from . import annotate, market, ocr
+from . import market, ocr
 from .items_db import ItemsIndex
 
 log = logging.getLogger(__name__)
 
-IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
-
 
 @dataclass(frozen=True)
-class MatchedItem:
+class ScanResult:
     name: str
     slug: str
     price: market.PriceEstimate
-    bbox: tuple[int, int, int, int]
-    source_image: str
+    raw_text: str  # the OCR line that produced this match - handy for diagnosing a wrong match
 
 
-@dataclass(frozen=True)
-class SessionResult:
-    processed_images: int
-    matches: list[MatchedItem]
-    output_dir: Path
-
-
-def process_image(path: Path, items_index: ItemsIndex, output_dir: Path) -> list[MatchedItem]:
-    image = Image.open(path)
+def price_crop(image: Image.Image, items_index: ItemsIndex) -> tuple[ScanResult | None, list[str]]:
+    """Returns (result, raw_ocr_lines). raw_ocr_lines is every line of text
+    the OCR engine actually saw in the crop, regardless of whether any of
+    it matched - if a scan matches the wrong item (or nothing at all),
+    seeing exactly what the engine read is what actually explains why.
+    """
     lines = ocr.extract_lines(image)
+    raw_texts = [line.text for line in lines]
 
-    matched: list[MatchedItem] = []
-    labels: list[annotate.Label] = []
-    for line in lines:
-        item = items_index.match(line.text)
+    # Warframe's own UI wraps a long item name across 2+ lines within one
+    # tile (e.g. "Titania Prime" / "Blueprint"), so OCR reports them as
+    # separate lines. Matching each line alone means the matcher never sees
+    # the full name - "Titania Prime" alone is genuinely ambiguous (every
+    # part of that frame shares it), while the complete "Titania Prime
+    # Blueprint" is not. Try the whole crop's text joined together first (in
+    # top-to-bottom reading order), then fall back to each line alone.
+    candidates: list[str] = []
+    if len(lines) > 1:
+        ordered = sorted(lines, key=lambda l: l.bbox[1])
+        candidates.append(" ".join(l.text for l in ordered))
+    candidates.extend(line.text for line in lines)
+
+    for candidate_text in candidates:
+        item = items_index.match(candidate_text)
         if item is None:
             continue
         price = market.get_price(item.slug)
         if not price.has_data:
             continue  # matched a real item name but no live sell orders to price it with
-        matched.append(
-            MatchedItem(name=item.name, slug=item.slug, price=price, bbox=line.bbox, source_image=path.name)
+        log.info(
+            "Scan matched %s (%s) -> %.1fp avg (raw OCR: %r)", item.name, item.slug, price.avg_platinum, candidate_text
         )
-        approx = "~" if price.used_fallback else ""
-        labels.append(annotate.Label(bbox=line.bbox, text=f"{item.name}: {approx}{price.avg_platinum:g}p"))
+        return ScanResult(name=item.name, slug=item.slug, price=price, raw_text=candidate_text), raw_texts
 
-    annotated = annotate.draw_labels(image, labels)
-    out_path = output_dir / f"{path.stem}_priced.png"
-    annotated.save(out_path)
-    log.info("Processed %s: %d item(s) matched -> %s", path.name, len(matched), out_path.name)
-    return matched
+    return None, raw_texts
 
 
-def process_session(
-    session_dir: Path,
-    output_dir: Path,
+@dataclass(frozen=True)
+class RegionMatch:
+    name: str
+    slug: str
+    price: market.PriceEstimate
+    bbox: tuple[int, int, int, int]  # position within the captured region (not the screen)
+
+
+def price_region(
+    image: Image.Image,
     items_index: ItemsIndex,
-    on_progress: Optional[Callable[[str], None]] = None,
-) -> SessionResult:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    image_paths = sorted(
-        p for p in session_dir.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES
-    )
-    report = on_progress or (lambda _msg: None)
+    on_match: Optional[Callable[[RegionMatch], None]] = None,
+) -> list[RegionMatch]:
+    """OCRs a larger region that may contain many different items (a
+    user-dragged multi-select box spanning several inventory tiles), and
+    prices every one found.
 
-    all_matches: list[MatchedItem] = []
-    for i, path in enumerate(image_paths, start=1):
-        try:
-            matches = process_image(path, items_index, output_dir)
-            all_matches.extend(matches)
-            report(f"[{i}/{len(image_paths)}] {path.name}: {len(matches)} item(s) matched")
-        except Exception:
-            log.exception("Failed to process %s", path)
-            report(f"[{i}/{len(image_paths)}] {path.name}: FAILED (see data/logs/app.log)")
+    Unlike price_crop (which assumes every line belongs to ONE item's name
+    and is safe to join wholesale), lines here can belong to entirely
+    different items, so a line is only combined with another if that other
+    line sits directly below it and roughly horizontally aligned (small
+    vertical gap, similar left edge) - not just whichever line happens to
+    come next in reading order, which for a multi-column grid is usually
+    the next item along the SAME row, not the row below. This handles
+    Warframe's habit of wrapping a long name across 2 lines within one tile
+    without merging two different tiles' names together.
 
-    write_summary(all_matches, output_dir)
-    return SessionResult(processed_images=len(image_paths), matches=all_matches, output_dir=output_dir)
+    Calls on_match(match) as each item is found and priced, so a caller can
+    update a live on-screen overlay incrementally rather than waiting for
+    the whole (possibly slow - one live price lookup per item) region to
+    finish.
+    """
+    lines = ocr.extract_lines(image, sparse=True)
+    matches: list[RegionMatch] = []
+    skip_indices: set[int] = set()
 
+    for i, line in enumerate(lines):
+        if i in skip_indices:
+            continue
 
-def write_summary(matches: list[MatchedItem], output_dir: Path) -> None:
-    summary_path = output_dir / "summary.txt"
-    if not matches:
-        summary_path.write_text(
-            "No items were recognized. Try bigger/clearer screenshots, or check that "
-            "data/logs/app.log doesn't show a Tesseract error.\n",
-            encoding="utf-8",
-        )
-        return
+        lx, ly, lw, lh = line.bbox
+        partner_idx = None
+        best_gap = None
+        for j, other in enumerate(lines):
+            if j == i or j in skip_indices:
+                continue
+            ox, oy, _ow, _oh = other.bbox
+            gap = oy - (ly + lh)
+            if gap < 0 or gap > lh:
+                continue  # not directly below (or too far below) this line
+            if abs(ox - lx) >= lw:
+                continue  # not aligned with this tile's left edge
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                partner_idx = j
 
-    by_name: dict[str, list[MatchedItem]] = {}
-    for m in matches:
-        by_name.setdefault(m.name, []).append(m)
+        candidate_texts = [line.text]
+        if partner_idx is not None:
+            candidate_texts.insert(0, f"{line.text} {lines[partner_idx].text}")
 
-    lines = [f"WF-PriceTracker summary - {len(matches)} item instance(s) detected\n"]
-    total = 0.0
-    for name, instances in sorted(by_name.items(), key=lambda kv: kv[0]):
-        price = instances[0].price
-        approx = "~" if price.used_fallback else ""
-        count = len(instances)
-        subtotal = price.avg_platinum * count
-        total += subtotal
-        lines.append(f"  {name}  x{count}  @ {approx}{price.avg_platinum:g}p avg  = {subtotal:g}p")
+        matched_item = None
+        used_combo = False
+        for text in candidate_texts:
+            matched_item = items_index.match(text)
+            if matched_item is not None:
+                used_combo = text != line.text
+                break
 
-    lines.append(
-        f"\nEstimated total: {total:g}p "
-        "(naive sum of avg sell price x detected instances - "
-        "a '~' means no online/in-game sellers were found so it falls back to all listings; "
-        "this can't tell stack quantities apart from repeated icons, so treat it as a rough estimate)"
-    )
-    summary_path.write_text("\n".join(lines), encoding="utf-8")
+        if matched_item is None:
+            continue
+
+        price = market.get_price(matched_item.slug)
+        if not price.has_data:
+            continue
+
+        bbox = line.bbox
+        if used_combo:
+            partner = lines[partner_idx]
+            skip_indices.add(partner_idx)
+            x0 = min(line.bbox[0], partner.bbox[0])
+            y0 = min(line.bbox[1], partner.bbox[1])
+            x1 = max(line.bbox[0] + line.bbox[2], partner.bbox[0] + partner.bbox[2])
+            y1 = max(line.bbox[1] + line.bbox[3], partner.bbox[1] + partner.bbox[3])
+            bbox = (x0, y0, x1 - x0, y1 - y0)
+
+        match = RegionMatch(name=matched_item.name, slug=matched_item.slug, price=price, bbox=bbox)
+        matches.append(match)
+        if on_match:
+            on_match(match)
+
+    return matches

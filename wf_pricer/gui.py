@@ -1,7 +1,7 @@
 """The visible app window.
 
 Tkinter isn't thread-safe, so every widget mutation has to happen on the Tk
-thread. Other threads (the pynput hotkey thread, the background processing
+thread. Other threads (the pynput hotkey thread, the background scan-worker
 thread) only ever call the thread-safe methods here (log/set_status/etc),
 which either push onto a queue.Queue the Tk mainloop polls, or schedule a
 callback via root.after(0, ...).
@@ -13,34 +13,64 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable
 
+from pynput import mouse
+
+from . import config
+from .scan import virtual_screen_rect
+
 
 class AppWindow:
+    _ENGINE_OPTIONS = [
+        ("easyocr", "EasyOCR (accurate, slower)"),
+        ("tesseract", "Tesseract (fast, local)"),
+        ("claude_vision", "Claude Vision (in development)"),
+        ("gemini_vision", "Gemini Vision (in development)"),
+    ]
+
     def __init__(
         self,
-        on_toggle_capture: Callable[[], None],
-        on_capture_now: Callable[[], None],
-        on_open_output: Callable[[], None],
+        on_toggle_scan: Callable[[], None],
+        on_scan_now: Callable[[], None],
+        on_set_box_size: Callable[[], None],
+        on_refresh_catalog: Callable[[], None],
+        on_engine_change: Callable[[str], None],
+        on_set_anthropic_key: Callable[[str], None],
+        on_set_google_key: Callable[[str], None],
+        on_selection_mode_change: Callable[[str], None],
         on_quit: Callable[[], None],
     ) -> None:
         self._log_queue: "queue.Queue[str]" = queue.Queue()
 
         self.root = tk.Tk()
         self.root.title("WF-PriceTracker")
-        self.root.geometry("460x420")
-        self.root.minsize(360, 300)
+        self.root.geometry("460x500")
+        self.root.minsize(360, 360)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.status_var = tk.StringVar(value="Idle")
-        self.count_var = tk.StringVar(value="")
+        self.box_size_var = tk.StringVar(value="Box size: not set")
         self.topmost_var = tk.BooleanVar(value=False)
+        self.engine_var = tk.StringVar()
+        self.selection_mode_var = tk.StringVar(value="single")
+        self._current_engine_key = "tesseract"
 
-        self._on_toggle_capture = on_toggle_capture
-        self._on_capture_now = on_capture_now
-        self._on_open_output = on_open_output
+        self._on_toggle_scan = on_toggle_scan
+        self._on_scan_now = on_scan_now
+        self._on_set_box_size = on_set_box_size
+        self._on_refresh_catalog = on_refresh_catalog
+        self._on_engine_change = on_engine_change
+        self._on_set_anthropic_key = on_set_anthropic_key
+        self._on_set_google_key = on_set_google_key
+        self._on_selection_mode_change = on_selection_mode_change
         self._on_quit = on_quit
 
         self._build_widgets()
         self._poll_queue()
+
+        self._snip_overlay = SnipOverlay(self.root)
+        self._calibrator: BoxSizeCalibrator | None = None
+        self._cursor_box_overlay = CursorBoxOverlay(self.root)
+        self._multi_result_overlay = MultiResultOverlay(self.root)
 
     def _build_widgets(self) -> None:
         pad = {"padx": 10, "pady": 6}
@@ -48,17 +78,61 @@ class AppWindow:
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill="x", **pad)
         ttk.Label(status_frame, textvariable=self.status_var, font=("Segoe UI", 14, "bold")).pack(side="left")
-        ttk.Label(status_frame, textvariable=self.count_var, font=("Segoe UI", 10)).pack(side="right")
+        ttk.Label(status_frame, textvariable=self.box_size_var, font=("Segoe UI", 10)).pack(side="right")
+
+        mode_frame = ttk.Frame(self.root)
+        mode_frame.pack(fill="x", **pad)
+        ttk.Label(mode_frame, text="Selection Mode:").pack(side="left")
+        ttk.Radiobutton(
+            mode_frame, text="Single Item", value="single", variable=self.selection_mode_var,
+            command=self._on_selection_mode_selected,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Radiobutton(
+            mode_frame, text="Multi-Select", value="multi", variable=self.selection_mode_var,
+            command=self._on_selection_mode_selected,
+        ).pack(side="left", padx=(6, 0))
 
         btn_frame = ttk.Frame(self.root)
         btn_frame.pack(fill="x", **pad)
-        self.toggle_btn = ttk.Button(btn_frame, text="Start Capture (F10)", command=self._on_toggle_capture)
+        self.toggle_btn = ttk.Button(btn_frame, text="Start Scan Mode (F10)", command=self._on_toggle_scan)
         self.toggle_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ttk.Button(btn_frame, text="Capture Now (F9)", command=self._on_capture_now).pack(
+        self.scan_now_btn = ttk.Button(btn_frame, text="Scan Now (F9)", command=self._on_scan_now)
+        self.scan_now_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
+
+        setup_frame = ttk.Frame(self.root)
+        setup_frame.pack(fill="x", **pad)
+        ttk.Button(setup_frame, text="Set Item Box Size...", command=self._on_set_box_size).pack(
+            side="left", expand=True, fill="x", padx=(0, 4)
+        )
+        ttk.Button(setup_frame, text="Refresh Item List", command=self._on_refresh_catalog).pack(
             side="left", expand=True, fill="x", padx=(4, 0)
         )
 
-        ttk.Button(self.root, text="Open Output Folder", command=self._on_open_output).pack(fill="x", **pad)
+        engine_frame = ttk.Frame(self.root)
+        engine_frame.pack(fill="x", **pad)
+        ttk.Label(engine_frame, text="OCR Engine:").pack(side="left")
+        self.engine_combo = ttk.Combobox(
+            engine_frame,
+            textvariable=self.engine_var,
+            values=[label for _key, label in self._ENGINE_OPTIONS],
+            state="readonly",
+        )
+        self.engine_combo.pack(side="left", expand=True, fill="x", padx=(6, 0))
+        self.engine_combo.bind("<<ComboboxSelected>>", self._on_engine_selected)
+
+        key_frame = ttk.Frame(self.root)
+        key_frame.pack(fill="x", padx=10, pady=(0, 6))
+        # Disabled for now - Claude/Gemini Vision are still in development
+        # (see config.DISABLED_ENGINES). Re-enabling these is just removing
+        # state="disabled" once those engines are ready.
+        self.anthropic_key_btn = ttk.Button(
+            key_frame, text="Set Anthropic Key...", command=self._prompt_anthropic_key, state="disabled"
+        )
+        self.anthropic_key_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self.google_key_btn = ttk.Button(
+            key_frame, text="Set Google Key...", command=self._prompt_google_key, state="disabled"
+        )
+        self.google_key_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
 
         log_frame = ttk.Frame(self.root)
         log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
@@ -74,12 +148,101 @@ class AppWindow:
             bottom, text="Always on top", variable=self.topmost_var, command=self._apply_topmost
         ).pack(side="left")
         ttk.Button(bottom, text="Quit", command=self._on_quit).pack(side="right")
-        ttk.Label(bottom, text="F10: toggle capture   F9: snap   Ctrl+F10: quit", foreground="gray").pack(
-            side="right", padx=8
-        )
+        self.hint_var = tk.StringVar(value="F10: toggle scan mode   F9: scan at cursor   Ctrl+F10: quit")
+        ttk.Label(bottom, textvariable=self.hint_var, foreground="gray").pack(side="right", padx=8)
 
     def _apply_topmost(self) -> None:
         self.root.attributes("-topmost", self.topmost_var.get())
+
+    def _on_selection_mode_selected(self) -> None:
+        mode = self.selection_mode_var.get()
+        if mode == "multi":
+            self.scan_now_btn.state(["disabled"])
+            self.hint_var.set("F10: toggle scan mode   drag to select & scan   Ctrl+F10: quit")
+        else:
+            self.scan_now_btn.state(["!disabled"])
+            self.hint_var.set("F10: toggle scan mode   F9: scan at cursor   Ctrl+F10: quit")
+        self._on_selection_mode_change(mode)
+
+    def set_selection_mode_selection(self, mode: str) -> None:
+        """Reflects the persisted selection mode at startup without firing
+        the on_selection_mode_change callback. Thread-safe.
+        """
+
+        def _set() -> None:
+            self.selection_mode_var.set(mode)
+            self._on_selection_mode_selected_ui_only(mode)
+
+        self.call_soon(_set)
+
+    def _on_selection_mode_selected_ui_only(self, mode: str) -> None:
+        if mode == "multi":
+            self.scan_now_btn.state(["disabled"])
+            self.hint_var.set("F10: toggle scan mode   drag to select & scan   Ctrl+F10: quit")
+        else:
+            self.scan_now_btn.state(["!disabled"])
+            self.hint_var.set("F10: toggle scan mode   F9: scan at cursor   Ctrl+F10: quit")
+
+    def _on_engine_selected(self, _event: object = None) -> None:
+        label = self.engine_var.get()
+        for key, lbl in self._ENGINE_OPTIONS:
+            if lbl != label:
+                continue
+            if key in config.DISABLED_ENGINES:
+                # Snap the dropdown back to whatever was actually active -
+                # ttk.Combobox has no per-item disabled state, so this is
+                # the only way to make an entry genuinely unpickable while
+                # still showing it (labeled "in development") for context.
+                self.set_engine_selection(self._current_engine_key)
+                self.log(f"{lbl} isn't selectable yet - still in development.")
+                return
+            self._current_engine_key = key
+            self._on_engine_change(key)
+            return
+
+    def _prompt_anthropic_key(self) -> None:
+        key = self._ask_api_key(
+            "Anthropic API key",
+            "Paste your Anthropic API key (used only for the Claude Vision "
+            "OCR engine). Saved locally to data/cache/anthropic_api_key.json, "
+            "which is gitignored - never put a real key in a tracked file.",
+        )
+        if key:
+            self._on_set_anthropic_key(key)
+
+    def _prompt_google_key(self) -> None:
+        key = self._ask_api_key(
+            "Google AI Studio API key",
+            "Paste your Google AI Studio API key (used only for the Gemini "
+            "Vision OCR engine). Saved locally to "
+            "data/cache/google_api_key.json, which is gitignored - never put "
+            "a real key in a tracked file.",
+        )
+        if key:
+            self._on_set_google_key(key)
+
+    def _ask_api_key(self, title: str, prompt: str) -> str | None:
+        # Local import: simpledialog is rarely needed elsewhere, and this
+        # keeps the module's top-level imports lean.
+        from tkinter import simpledialog
+
+        key = simpledialog.askstring(title, prompt, show="*", parent=self.root)
+        return key.strip() if key else None
+
+    def set_engine_selection(self, engine_key: str) -> None:
+        """Reflects the current engine in the dropdown without firing the
+        on_engine_change callback (used at startup to show the persisted
+        choice). Thread-safe.
+        """
+
+        def _set() -> None:
+            for key, label in self._ENGINE_OPTIONS:
+                if key == engine_key:
+                    self.engine_var.set(label)
+                    self._current_engine_key = engine_key
+                    return
+
+        self.call_soon(_set)
 
     def _on_close(self) -> None:
         # Closing the window just hides it to the tray; the tray icon (or
@@ -96,8 +259,8 @@ class AppWindow:
     def set_status(self, text: str) -> None:
         self.call_soon(lambda: self.status_var.set(text))
 
-    def set_count(self, text: str) -> None:
-        self.call_soon(lambda: self.count_var.set(text))
+    def set_box_size_label(self, text: str) -> None:
+        self.call_soon(lambda: self.box_size_var.set(text))
 
     def set_toggle_label(self, text: str) -> None:
         self.call_soon(lambda: self.toggle_btn.config(text=text))
@@ -109,6 +272,61 @@ class AppWindow:
             self.root.focus_force()
 
         self.call_soon(_show)
+
+    def show_lookup_result(self, x: int, y: int, lines: list[str]) -> None:
+        self.call_soon(lambda: ResultPopup(self.root, x, y, lines))
+
+    def start_box_calibration(
+        self,
+        on_complete: Callable[[int, int], None],
+        on_cancel: Callable[[], None],
+    ) -> None:
+        """Starts a one-shot drag-to-measure session: shows a live overlay,
+        listens for exactly one drag anywhere on screen, then reports the
+        box size (or cancels on too small a drag). Must be called from the
+        Tk thread (it's wired to a button).
+        """
+        if self._calibrator is not None:
+            return  # already calibrating
+        self._calibrator = BoxSizeCalibrator(
+            self.root,
+            self._snip_overlay,
+            on_complete=lambda w, h: (self._clear_calibrator(), on_complete(w, h)),
+            on_cancel=lambda: (self._clear_calibrator(), on_cancel()),
+        )
+        self._calibrator.start()
+
+    def _clear_calibrator(self) -> None:
+        self._calibrator = None
+
+    # --- cursor-following box outline shown while scan mode is on --------
+    def show_cursor_box(self, box_w: int, box_h: int, x: int, y: int) -> None:
+        self.call_soon(lambda: self._cursor_box_overlay.show(box_w, box_h, x, y))
+
+    def update_cursor_box_position(self, x: int, y: int) -> None:
+        self.call_soon(lambda: self._cursor_box_overlay.move_to(x, y))
+
+    def hide_cursor_box(self) -> None:
+        self.call_soon(lambda: self._cursor_box_overlay.hide())
+
+    # --- multi-select drag rectangle (reuses the same overlay class the
+    # box-size calibrator uses, just driven by DragSelectWatcher instead) --
+    def show_drag_select_box(self, x: int, y: int) -> None:
+        self.call_soon(lambda: self._snip_overlay.begin(x, y))
+
+    def update_drag_select_box(self, x: int, y: int) -> None:
+        self.call_soon(lambda: self._snip_overlay.update_to(x, y))
+
+    def hide_drag_select_box(self) -> None:
+        self.call_soon(lambda: self._snip_overlay.end())
+
+    # --- multi-select results: name+price labels drawn in place over each
+    # detected item, added incrementally as they're found/priced ----------
+    def clear_multi_results(self) -> None:
+        self.call_soon(lambda: self._multi_result_overlay.clear())
+
+    def add_multi_result_label(self, x: int, y: int, name: str, price_text: str) -> None:
+        self.call_soon(lambda: self._multi_result_overlay.add_label(x, y, name, price_text))
 
     # --- internals -------------------------------------------------------
     def _poll_queue(self) -> None:
@@ -134,3 +352,315 @@ class AppWindow:
     def _destroy_now(self) -> None:
         self.root.quit()
         self.root.destroy()
+
+
+class SnipOverlay(tk.Toplevel):
+    """A borderless, always-on-top window that draws a live selection
+    rectangle while the user drags, spanning the whole virtual desktop so
+    it works no matter which monitor the drag happens on. Ordinary
+    corner-to-corner drag: the press point is one corner of the box, and it
+    grows toward wherever the mouse is dragged, same as a normal
+    click-and-drag selection.
+
+    This window does NOT handle the mouse itself - input comes from a
+    pynput mouse listener (see BoxSizeCalibrator), which is the only
+    reliable way to track a drag that started over another window (e.g.
+    Warframe). This is purely a rendering surface.
+    """
+
+    _TRANSPARENT_KEY = "#010203"  # arbitrary color used as the "invisible" background
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-transparentcolor", self._TRANSPARENT_KEY)
+        except tk.TclError:
+            # -transparentcolor is a Windows-only Tk feature; degrade to a
+            # faint tint elsewhere rather than crashing.
+            self.attributes("-alpha", 0.25)
+
+        self._offset = (0, 0)
+        self.canvas = tk.Canvas(self, bg=self._TRANSPARENT_KEY, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        self._rect_id: int | None = None
+        self._start: tuple[int, int] | None = None
+
+    def _refresh_geometry(self) -> None:
+        # Re-measured every time a drag begins rather than cached once at
+        # startup, in case the display configuration (e.g. a game switching
+        # resolutions) changed since this overlay was created.
+        left, top, width, height = virtual_screen_rect()
+        self.geometry(f"{width}x{height}+{left}+{top}")
+        self._offset = (left, top)
+
+    def _to_canvas(self, x: int, y: int) -> tuple[int, int]:
+        ox, oy = self._offset
+        return (x - ox, y - oy)
+
+    def begin(self, x: int, y: int) -> None:
+        self._refresh_geometry()
+        self._start = (x, y)
+        if self._rect_id is not None:
+            self.canvas.delete(self._rect_id)
+        cx, cy = self._to_canvas(x, y)
+        self._rect_id = self.canvas.create_rectangle(cx, cy, cx, cy, outline="#4ddbea", width=2)
+        self.deiconify()
+        self.lift()
+
+    def update_to(self, x: int, y: int) -> None:
+        if self._start is None or self._rect_id is None:
+            return
+        cx0, cy0 = self._to_canvas(*self._start)
+        cx1, cy1 = self._to_canvas(x, y)
+        self.canvas.coords(self._rect_id, cx0, cy0, cx1, cy1)
+
+    def end(self) -> None:
+        self._start = None
+        if self._rect_id is not None:
+            self.canvas.delete(self._rect_id)
+            self._rect_id = None
+        self.withdraw()
+
+
+class CursorBoxOverlay(tk.Toplevel):
+    """A borderless, always-on-top window that continuously shows a
+    fixed-size box outline centered on the cursor while scan mode is on, so
+    you can see exactly what will be grabbed before pressing the scan
+    hotkey. Purely a rendering surface - actual cursor tracking comes from
+    a pynput mouse listener (see scan.CursorTracker); this just gets told
+    where to draw.
+    """
+
+    _TRANSPARENT_KEY = "#010203"
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-transparentcolor", self._TRANSPARENT_KEY)
+        except tk.TclError:
+            self.attributes("-alpha", 0.25)
+
+        self._offset = (0, 0)
+        self.canvas = tk.Canvas(self, bg=self._TRANSPARENT_KEY, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        self._rect_id: int | None = None
+        self._box_w = 0
+        self._box_h = 0
+
+    def _refresh_geometry(self) -> None:
+        left, top, width, height = virtual_screen_rect()
+        self.geometry(f"{width}x{height}+{left}+{top}")
+        self._offset = (left, top)
+
+    def _to_canvas(self, x: float, y: float) -> tuple[float, float]:
+        ox, oy = self._offset
+        return (x - ox, y - oy)
+
+    def show(self, box_w: int, box_h: int, x: int, y: int) -> None:
+        self._refresh_geometry()
+        self._box_w, self._box_h = box_w, box_h
+        if self._rect_id is not None:
+            self.canvas.delete(self._rect_id)
+        self._rect_id = self.canvas.create_rectangle(0, 0, 0, 0, outline="#4ddbea", width=2)
+        self.move_to(x, y)
+        self.deiconify()
+        self.lift()
+
+    def move_to(self, x: int, y: int) -> None:
+        if self._rect_id is None:
+            return
+        half_w, half_h = self._box_w / 2, self._box_h / 2
+        cx0, cy0 = self._to_canvas(x - half_w, y - half_h)
+        cx1, cy1 = self._to_canvas(x + half_w, y + half_h)
+        self.canvas.coords(self._rect_id, cx0, cy0, cx1, cy1)
+
+    def hide(self) -> None:
+        if self._rect_id is not None:
+            self.canvas.delete(self._rect_id)
+            self._rect_id = None
+        self.withdraw()
+
+
+class MultiResultOverlay(tk.Toplevel):
+    """A borderless, always-on-top window that draws name+price labels at
+    multiple screen positions at once - used by multi-select scan mode to
+    label every detected item in place, directly over the game, as each one
+    is found and priced. clear() removes everything (called when a new
+    multi-select drag starts) so results never pile up from an old scan.
+    """
+
+    _TRANSPARENT_KEY = "#010203"
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-transparentcolor", self._TRANSPARENT_KEY)
+        except tk.TclError:
+            self.attributes("-alpha", 0.25)
+
+        self._offset = (0, 0)
+        self.canvas = tk.Canvas(self, bg=self._TRANSPARENT_KEY, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self._item_ids: list[int] = []
+
+    def _refresh_geometry(self) -> None:
+        left, top, width, height = virtual_screen_rect()
+        self.geometry(f"{width}x{height}+{left}+{top}")
+        self._offset = (left, top)
+
+    def _to_canvas(self, x: int, y: int) -> tuple[int, int]:
+        ox, oy = self._offset
+        return (x - ox, y - oy)
+
+    def clear(self) -> None:
+        for item_id in self._item_ids:
+            self.canvas.delete(item_id)
+        self._item_ids.clear()
+        self.withdraw()
+
+    def add_label(self, x: int, y: int, name: str, price_text: str) -> None:
+        """Draws one name+price label with its top-left corner at screen
+        position (x, y). Safe to call repeatedly without clearing first -
+        each call adds a new label alongside whatever's already shown.
+        """
+        self._refresh_geometry()
+        cx, cy = self._to_canvas(x, y)
+        pad = 4
+
+        name_id = self.canvas.create_text(
+            cx + pad, cy + pad, text=name, anchor="nw", fill="#4ddbea", font=("Segoe UI", 9, "bold")
+        )
+        price_id = self.canvas.create_text(
+            cx + pad, cy + pad + 14, text=price_text, anchor="nw", fill="#dddddd", font=("Segoe UI", 8)
+        )
+        name_box = self.canvas.bbox(name_id)
+        price_box = self.canvas.bbox(price_id)
+        right = max(name_box[2], price_box[2]) + pad
+        bottom = price_box[3] + pad
+        bg_id = self.canvas.create_rectangle(cx, cy, right, bottom, fill="#121214", outline="#4ddbea", width=1)
+        self.canvas.tag_lower(bg_id, name_id)
+
+        self._item_ids.extend([bg_id, name_id, price_id])
+        self.deiconify()
+        self.lift()
+
+
+class BoxSizeCalibrator:
+    """One-shot: temporarily listens for a single left-click-drag anywhere
+    on screen (via its own short-lived pynput mouse listener - not a
+    persistent global hook, it stops itself as soon as the drag ends) and
+    reports the resulting box size. Used by the "Set Item Box Size..."
+    button to measure one item's icon+name tile without needing pixel math.
+
+    Ordinary corner-to-corner drag: press at one corner of the item (e.g.
+    top-left), drag to the opposite corner, release. The measured box is
+    whatever rectangle you actually dragged out - it does not get
+    recentered or resized afterward. Where that box then gets *placed* on
+    each scan (centered on the cursor) is a separate matter, handled by
+    scan.grab_box_at.
+    """
+
+    MIN_DRAG_PX = 10
+
+    def __init__(
+        self,
+        root: tk.Misc,
+        overlay: SnipOverlay,
+        on_complete: Callable[[int, int], None],
+        on_cancel: Callable[[], None],
+    ) -> None:
+        self._root = root
+        self._overlay = overlay
+        self._on_complete = on_complete
+        self._on_cancel = on_cancel
+        self._start: tuple[int, int] | None = None
+        self._listener: mouse.Listener | None = None
+
+    def start(self) -> None:
+        self._listener = mouse.Listener(on_click=self._on_click, on_move=self._on_move)
+        self._listener.start()
+
+    def _stop_listener(self) -> None:
+        if self._listener is not None:
+            self._listener.stop()
+            self._listener = None
+
+    def _on_click(self, x: int, y: int, button: mouse.Button, pressed: bool) -> None:
+        if button != mouse.Button.left:
+            return
+        if pressed:
+            self._start = (x, y)
+            self._root.after(0, lambda: self._overlay.begin(x, y))
+            return
+
+        start = self._start
+        self._start = None
+        self._stop_listener()
+        self._root.after(0, self._overlay.end)
+        if start is None:
+            return
+        x0, y0 = start
+        width, height = abs(x - x0), abs(y - y0)
+        if width < self.MIN_DRAG_PX or height < self.MIN_DRAG_PX:
+            self._root.after(0, self._on_cancel)
+        else:
+            self._root.after(0, lambda: self._on_complete(width, height))
+
+    def _on_move(self, x: int, y: int) -> None:
+        if self._start is not None:
+            self._root.after(0, lambda: self._overlay.update_to(x, y))
+
+
+class ResultPopup(tk.Toplevel):
+    """A small, auto-dismissing box showing a single-item scan result near
+    where the box was scanned. Click it (or wait) to dismiss.
+    """
+
+    def __init__(self, parent: tk.Misc, x: int, y: int, lines: list[str], duration_ms: int = 6000) -> None:
+        super().__init__(parent)
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-alpha", 0.95)
+        except tk.TclError:
+            pass
+
+        frame = tk.Frame(self, bg="#121214", highlightbackground="#4ddbea", highlightthickness=1)
+        frame.pack()
+        for i, line in enumerate(lines):
+            tk.Label(
+                frame,
+                text=line,
+                bg="#121214",
+                fg="#4ddbea" if i == 0 else "#dddddd",
+                font=("Segoe UI", 11, "bold") if i == 0 else ("Segoe UI", 9),
+                justify="left",
+                anchor="w",
+            ).pack(fill="x", padx=10, pady=(8 if i == 0 else 0, 8 if i == len(lines) - 1 else 3))
+
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        vleft, vtop, vwidth, vheight = virtual_screen_rect()
+        px = min(max(x, vleft), vleft + vwidth - w)
+        py = min(max(y, vtop), vtop + vheight - h)
+        self.geometry(f"+{px}+{py}")
+
+        self.bind("<Button-1>", lambda _e: self._safe_destroy())
+        self.after(duration_ms, self._safe_destroy)
+
+    def _safe_destroy(self) -> None:
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass

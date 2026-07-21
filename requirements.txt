@@ -1,5 +1,8 @@
 pillow>=10.0
+easyocr>=1.7
 pytesseract>=0.3.10
+anthropic>=0.40
+google-genai>=1.0
 pynput>=1.7
 pystray>=0.19
 rapidfuzz>=3.0

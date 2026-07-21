@@ -1,32 +1,54 @@
 """WF-PriceTracker entry point.
 
 Run with `python -m wf_pricer.main` (or via run.py / run.pyw at the repo
-root). Opens an app window plus a tray icon:
+root). Opens an app window plus a tray icon. F10 toggles scan mode;
+Ctrl+F10 quits. What scanning actually does depends on the Selection Mode
+picked in the window:
 
-  - F9  captures one screenshot (only while capture mode is on)
-  - F10 toggles capture mode; turning it OFF processes everything captured
-        this session and drops annotated, priced images in data/output/
-  - Ctrl+F10 quits
-
-The window mirrors all of these as buttons for when hotkeys aren't
-convenient, and shows a live log of what's happening. Closing the window
-just hides it to the tray (left-click the tray icon, or its "Show window"
-menu item, to bring it back) - use Quit (button, tray menu, or Ctrl+F10) to
-actually exit.
+  - Single Item (default) - hover an item, press F9. Grabs a box centered
+    on the cursor (size set once via "Set Item Box Size..."), OCRs it,
+    matches it against warframe.market, and shows the price in a popup
+    next to the cursor.
+  - Multi-Select - drag a box around any number of items; releasing the
+    drag captures that whole region, OCRs it for every item inside, and
+    labels each one in place with its name and price.
 """
 from __future__ import annotations
 
+import ctypes
+import datetime
 import logging
-import os
 import threading
 from logging.handlers import RotatingFileHandler
 
 import pystray
 
-from . import capture, config, gui, items_db, pipeline
+from . import config, gui, items_db, pipeline, scan
 from . import tray as tray_mod
 
 log = logging.getLogger(__name__)
+
+
+def _set_dpi_aware() -> None:
+    """Marks this process as per-monitor DPI aware.
+
+    Without this, a process that hasn't declared its DPI awareness gets its
+    coordinates silently virtualized/scaled by Windows - GetSystemMetrics,
+    pynput's reported cursor position, and Tkinter's own window geometry
+    would all agree with EACH OTHER, but not necessarily with a DPI-aware
+    fullscreen application's own idea of where the cursor is. Warframe (like
+    most modern games) is DPI-aware, so without this call our overlays could
+    end up systematically offset from the real cursor position specifically
+    while it's focused, even though everything looks consistent when tested
+    against the desktop alone. Must be called before any window is created.
+    """
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE (Windows 8.1+)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()  # fallback (Vista+)
+        except (AttributeError, OSError):
+            log.warning("Could not set process DPI awareness", exc_info=True)
 
 
 def _setup_logging() -> None:
@@ -45,11 +67,15 @@ def _setup_logging() -> None:
 
 class App:
     def __init__(self) -> None:
-        self.session = capture.CaptureSession()
         self.icon: pystray.Icon | None = None
         self.window: gui.AppWindow | None = None
         self.items_index = None
-        self._processing_lock = threading.Lock()
+        self.scan_active = False
+        self.scan_count = 0
+        self.selection_mode = config.SELECTION_MODE
+        self.cursor_tracker: scan.CursorTracker | None = None
+        self.drag_select_watcher: scan.DragSelectWatcher | None = None
+        self._catalog_refresh_lock = threading.Lock()
 
     def load_items(self) -> None:
         try:
@@ -61,44 +87,118 @@ class App:
             if self.window:
                 self.window.log("ERROR: failed to load the item catalog (check your internet connection).")
 
-    # --- hotkey / button callbacks --------------------------------------
-    def on_capture(self) -> None:
-        if not self.session.active:
+    def refresh_catalog(self) -> None:
+        if not self._catalog_refresh_lock.acquire(blocking=False):
             if self.window:
-                self.window.log("Not capturing - press F10 (or the Start Capture button) first.")
+                self.window.log("Already refreshing the item catalog - hang on.")
             return
-        n = self.session.capture_one()
-        if n and self.window:
-            self.window.log(f"Captured screenshot #{n}")
-            self.window.set_count(f"{n} screenshot(s)")
+        if self.window:
+            self.window.log("Refreshing item catalog from warframe.market (bypassing the 3-day cache)...")
+        threading.Thread(target=self._refresh_catalog_worker, daemon=True).start()
 
-    def on_toggle(self) -> None:
-        if self.session.active:
-            self._stop_and_process()
-        else:
-            session_id = self.session.start()
-            self._refresh_icon()
+    def _refresh_catalog_worker(self) -> None:
+        try:
+            self.items_index = items_db.load_items_index(force_refresh=True)
+        except Exception:
+            log.exception("Failed to refresh item catalog")
             if self.window:
-                self.window.set_status("Capture mode ON")
-                self.window.set_toggle_label("Stop && Process (F10)")
-                self.window.set_count("0 screenshot(s)")
-                self.window.log(f"--- Capture session {session_id} started: F9 to snap, F10 to stop ---")
+                self.window.log("ERROR: failed to refresh item catalog - check your internet connection.")
+            return
+        finally:
+            self._catalog_refresh_lock.release()
+        if self.window:
+            self.window.log(f"Refreshed: {len(self.items_index)} matchable items (Sets are always excluded).")
+
+    # --- hotkey / button callbacks --------------------------------------
+    def on_toggle_scan(self) -> None:
+        self.scan_active = not self.scan_active
+        self._refresh_icon()
+        if self.scan_active:
+            self._start_mode_listener()
+        else:
+            self._stop_mode_listener()
+        if not self.window:
+            return
+        if self.scan_active:
+            self.window.set_status("Scan mode ON")
+            self.window.set_toggle_label("Stop Scan Mode (F10)")
+            if self.selection_mode == "multi":
+                self.window.log("--- Scan mode ON: drag a box around any items to scan them ---")
+            else:
+                self.window.log("--- Scan mode ON: hover an item, press F9 ---")
+        else:
+            self.window.set_status("Idle")
+            self.window.set_toggle_label("Start Scan Mode (F10)")
+            self.window.log("--- Scan mode OFF ---")
+
+    def on_scan(self) -> None:
+        if self.selection_mode == "multi":
+            if self.window:
+                self.window.log("F9 is for Single Item mode - Multi-Select scans on click-drag instead.")
+            return
+        if not self.scan_active:
+            if self.window:
+                self.window.log("Not scanning - press F10 (or Start Scan Mode) first.")
+            return
+        if config.BOX_WIDTH_PX is None or config.BOX_HEIGHT_PX is None:
+            if self.window:
+                self.window.log('Set your item box size first ("Set Item Box Size..." button).')
+            return
+        cx, cy = scan.get_cursor_position()
+        threading.Thread(target=self._scan_worker, args=(cx, cy), daemon=True).start()
+
+    def set_selection_mode(self, mode: str) -> None:
+        if mode == self.selection_mode:
+            return
+        was_active = self.scan_active
+        if was_active:
+            self._stop_mode_listener()
+        config.save_selection_mode(mode)
+        self.selection_mode = mode
+        if self.window:
+            self.window.log(f"Selection mode set to: {'Multi-Select' if mode == 'multi' else 'Single Item'}")
+        if was_active:
+            self._start_mode_listener()
+
+    _ENGINE_NAMES = {
+        "easyocr": "EasyOCR (accurate, slower)",
+        "tesseract": "Tesseract (fast, local)",
+        "claude_vision": "Claude Vision (in development)",
+        "gemini_vision": "Gemini Vision (in development)",
+    }
+
+    def set_engine(self, engine_key: str) -> None:
+        config.save_ocr_engine(engine_key)
+        if self.window:
+            self.window.log(f"OCR engine set to: {self._ENGINE_NAMES.get(engine_key, engine_key)}")
+
+    def set_anthropic_key(self, key: str) -> None:
+        config.save_anthropic_api_key(key)
+        if self.window:
+            self.window.log("Anthropic API key saved (data/cache/anthropic_api_key.json, gitignored).")
+
+    def set_google_key(self, key: str) -> None:
+        config.save_google_api_key(key)
+        if self.window:
+            self.window.log("Google API key saved (data/cache/google_api_key.json, gitignored).")
+
+    def set_box_size(self) -> None:
+        if self.window is None:
+            return
+        self.window.log("Drag a box around one item's icon+name on screen to set the box size...")
+        self.window.start_box_calibration(
+            on_complete=self._on_box_calibrated,
+            on_cancel=lambda: self.window.log("Box size calibration cancelled (drag was too small)."),
+        )
 
     def on_quit(self) -> None:
+        self._stop_mode_listener()
         if self.window:
             self.window.log("Quitting...")
         if self.icon:
             self.icon.stop()
         if self.window:
             self.window.destroy()
-
-    def open_output_folder(self) -> None:
-        try:
-            os.startfile(config.OUTPUT_DIR)
-        except OSError:
-            log.warning("Could not open output folder", exc_info=True)
-            if self.window:
-                self.window.log("Could not open the output folder.")
 
     def show_window(self) -> None:
         if self.window:
@@ -107,74 +207,183 @@ class App:
     # --- internals -------------------------------------------------------
     def _refresh_icon(self) -> None:
         if self.icon:
-            self.icon.icon = tray_mod.make_icon_image(self.session.active)
+            self.icon.icon = tray_mod.make_icon_image(self.scan_active)
 
-    def _stop_and_process(self) -> None:
-        self.session.stop()
-        self._refresh_icon()
-        count = self.session.count
-        session_dir = self.session.session_dir
-        session_id = self.session.session_id
-
+    def _on_box_calibrated(self, width: int, height: int) -> None:
+        config.save_box_calibration(width, height)
         if self.window:
-            self.window.set_status("Idle")
-            self.window.set_toggle_label("Start Capture (F10)")
+            self.window.set_box_size_label(f"Box size: {width}x{height}px")
+            self.window.log(f"Item box size set to {width}x{height}px.")
+        if self.scan_active and self.selection_mode == "single":
+            self._start_mode_listener()  # refresh the outline with the new size
 
-        if count == 0:
+    # --- mode-aware start/stop: dispatches to whichever selection mode is
+    # currently active whenever scan mode is toggled on/off, or the mode
+    # itself is switched while scan mode is already on. ---------------------
+    def _start_mode_listener(self) -> None:
+        if self.selection_mode == "multi":
+            self._start_drag_select()
+        else:
+            self._start_cursor_box()
+
+    def _stop_mode_listener(self) -> None:
+        self._stop_cursor_box()
+        self._stop_drag_select()
+
+    def _start_cursor_box(self) -> None:
+        if config.BOX_WIDTH_PX is None or config.BOX_HEIGHT_PX is None:
+            return  # nothing to show yet; on_scan() will prompt to set it
+        if self.cursor_tracker is None:
+            self.cursor_tracker = scan.CursorTracker(on_move=self._on_cursor_move)
+            self.cursor_tracker.start()
+        if self.window:
+            cx, cy = scan.get_cursor_position()
+            self.window.show_cursor_box(config.BOX_WIDTH_PX, config.BOX_HEIGHT_PX, cx, cy)
+
+    def _stop_cursor_box(self) -> None:
+        if self.cursor_tracker is not None:
+            self.cursor_tracker.stop()
+            self.cursor_tracker = None
+        if self.window:
+            self.window.hide_cursor_box()
+
+    def _on_cursor_move(self, x: int, y: int) -> None:
+        if self.window:
+            self.window.update_cursor_box_position(x, y)
+
+    def _start_drag_select(self) -> None:
+        if self.drag_select_watcher is None:
+            self.drag_select_watcher = scan.DragSelectWatcher(
+                on_drag_start=self._on_drag_select_start,
+                on_drag_update=self._on_drag_select_update,
+                on_drag_end=self._on_drag_select_end,
+            )
+            self.drag_select_watcher.start()
+
+    def _stop_drag_select(self) -> None:
+        if self.drag_select_watcher is not None:
+            self.drag_select_watcher.stop()
+            self.drag_select_watcher = None
+
+    def _on_drag_select_start(self, x: int, y: int) -> None:
+        if self.window:
+            self.window.clear_multi_results()
+            self.window.show_drag_select_box(x, y)
+
+    def _on_drag_select_update(self, x: int, y: int) -> None:
+        if self.window:
+            self.window.update_drag_select_box(x, y)
+
+    def _on_drag_select_end(self, left: int, top: int, right: int, bottom: int) -> None:
+        if self.window:
+            self.window.hide_drag_select_box()
+        threading.Thread(
+            target=self._multi_scan_worker, args=(left, top, right, bottom), daemon=True
+        ).start()
+
+    def _scan_worker(self, cx: int, cy: int) -> None:
+        try:
+            crop = scan.grab_box_at(cx, cy, config.BOX_WIDTH_PX, config.BOX_HEIGHT_PX)
+        except Exception:
+            log.exception("Scan screen capture failed")
+            return
+
+        if self.items_index is None:
             if self.window:
-                self.window.log("Capture mode off. No screenshots were taken.")
+                self.window.show_lookup_result(
+                    cx, cy, ["Still loading item catalog - try again in a moment."]
+                )
+            return
+
+        try:
+            result, raw_texts = pipeline.price_crop(crop, self.items_index)
+        except Exception:
+            log.exception("Scan OCR/pricing failed")
+            if self.window:
+                self.window.show_lookup_result(cx, cy, ["Scan failed - check data/logs/app.log"])
+            return
+
+        self.scan_count += 1
+        # Included in every log line so a wrong or missing match is
+        # actually diagnosable later - what did the OCR engine really see?
+        raw_display = " | ".join(raw_texts) if raw_texts else "(no text detected)"
+
+        if result is None:
+            if self.window:
+                self.window.show_lookup_result(cx, cy, ["No item recognized in that box."])
+                self.window.log(f"[{self.scan_count}] No match. OCR saw: {raw_display}")
+            return
+
+        approx = "~" if result.price.used_fallback else ""
+        price_line = (
+            f"{approx}{result.price.avg_platinum:g}p avg "
+            f"(lowest {result.price.lowest_platinum}p, n={result.price.sample_size})"
+        )
+        if self.window:
+            self.window.show_lookup_result(cx, cy, [result.name, price_line])
+            self.window.log(f"[{self.scan_count}] {result.name}: {price_line}  (OCR saw: {raw_display})")
+        self._append_scan_log(result.name, price_line, raw_display)
+
+    def _multi_scan_worker(self, left: int, top: int, right: int, bottom: int) -> None:
+        if self.items_index is None:
+            if self.window:
+                self.window.log("Still loading item catalog - try again in a moment.")
+            return
+
+        try:
+            region = scan.grab_region(left, top, right, bottom)
+        except Exception:
+            log.exception("Multi-select screen capture failed")
             return
 
         if self.window:
-            self.window.set_status(f"Processing {count} screenshot(s)...")
-            self.window.log(f"--- Processing {count} screenshot(s) ---")
-        threading.Thread(
-            target=self._process_worker, args=(session_dir, session_id, count), daemon=True
-        ).start()
+            self.window.log(f"--- Scanning region ({region.width}x{region.height}px)... ---")
 
-    def _process_worker(self, session_dir, session_id, count) -> None:
-        with self._processing_lock:
-            # Make sure every screenshot's background PNG write has actually
-            # finished before OCR tries to read the files.
-            self.session.wait_for_pending_saves()
+        found = 0
 
-            if self.items_index is None:
-                self.load_items()
-            if self.items_index is None:
-                if self.window:
-                    self.window.log("Aborting: item catalog unavailable.")
-                    self.window.set_status("Idle")
-                return
-
-            output_dir = config.OUTPUT_DIR / session_id
-            progress = self.window.log if self.window else (lambda _msg: None)
-            try:
-                result = pipeline.process_session(session_dir, output_dir, self.items_index, on_progress=progress)
-            except Exception:
-                log.exception("Processing failed")
-                if self.window:
-                    self.window.log("ERROR: processing failed - check data/logs/app.log")
-                    self.window.set_status("Idle")
-                return
-
-            unique_items = len({m.slug for m in result.matches})
+        def on_match(match: pipeline.RegionMatch) -> None:
+            nonlocal found
+            found += 1
+            self.scan_count += 1
+            approx = "~" if match.price.used_fallback else ""
+            price_line = (
+                f"{approx}{match.price.avg_platinum:g}p avg "
+                f"(lowest {match.price.lowest_platinum}p, n={match.price.sample_size})"
+            )
             if self.window:
-                self.window.log(
-                    f"--- Done! {unique_items} unique item(s) priced across {count} screenshot(s) ---"
-                )
-                self.window.set_status("Idle")
-                self.window.set_count("")
-            try:
-                os.startfile(output_dir)
-            except OSError:
-                log.warning("Could not auto-open output folder %s", output_dir)
+                screen_x = left + match.bbox[0]
+                screen_y = top + match.bbox[1]
+                self.window.add_multi_result_label(screen_x, screen_y, match.name, price_line)
+                self.window.log(f"[{self.scan_count}] {match.name}: {price_line}")
+            self._append_scan_log(match.name, price_line, "(multi-select)")
+
+        try:
+            pipeline.price_region(region, self.items_index, on_match=on_match)
+        except Exception:
+            log.exception("Multi-select OCR/pricing failed")
+            if self.window:
+                self.window.log("Region scan failed - check data/logs/app.log")
+            return
+
+        if self.window:
+            if found == 0:
+                self.window.log("No items recognized in that region.")
+            else:
+                self.window.log(f"--- Done: {found} item(s) found in region ---")
+
+    def _append_scan_log(self, name: str, price_line: str, raw_display: str) -> None:
+        timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+        try:
+            with open(config.SCAN_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{timestamp}  {name}: {price_line}  [OCR: {raw_display}]\n")
+        except OSError:
+            log.warning("Could not write to scan log file", exc_info=True)
 
     def build_tray(self) -> pystray.Icon:
         menu = pystray.Menu(
             pystray.MenuItem("Show window", lambda: self.show_window(), default=True),
-            pystray.MenuItem("Toggle capture mode (F10)", lambda: self.on_toggle()),
-            pystray.MenuItem("Capture screenshot now (F9)", lambda: self.on_capture()),
-            pystray.MenuItem("Open output folder", lambda: self.open_output_folder()),
+            pystray.MenuItem("Toggle scan mode (F10)", lambda: self.on_toggle_scan()),
+            pystray.MenuItem("Scan now (F9)", lambda: self.on_scan()),
             pystray.MenuItem("Quit (Ctrl+F10)", lambda: self.on_quit()),
         )
         self.icon = pystray.Icon("wf_pricer", tray_mod.make_icon_image(False), "WF-PriceTracker", menu)
@@ -182,30 +391,36 @@ class App:
 
 
 def main() -> None:
+    _set_dpi_aware()
     _setup_logging()
     log.info("Starting WF-PriceTracker")
-
-    if config.TESSERACT_PATH is None:
-        log.warning(
-            "Tesseract OCR engine not found on this machine. Install it from "
-            "https://github.com/UB-Mannheim/tesseract/wiki (or `winget install UB-Mannheim.TesseractOCR`) "
-            "or OCR will fail on every screenshot."
-        )
 
     app = App()
 
     window = gui.AppWindow(
-        on_toggle_capture=app.on_toggle,
-        on_capture_now=app.on_capture,
-        on_open_output=app.open_output_folder,
+        on_toggle_scan=app.on_toggle_scan,
+        on_scan_now=app.on_scan,
+        on_set_box_size=app.set_box_size,
+        on_refresh_catalog=app.refresh_catalog,
+        on_engine_change=app.set_engine,
+        on_set_anthropic_key=app.set_anthropic_key,
+        on_set_google_key=app.set_google_key,
+        on_selection_mode_change=app.set_selection_mode,
         on_quit=app.on_quit,
     )
     app.window = window
-    if config.TESSERACT_PATH is None:
-        window.log("WARNING: Tesseract OCR was not found - install it or OCR will fail on every screenshot.")
-    window.log("WF-PriceTracker ready. Loading item catalog...")
+    window.set_engine_selection(config.OCR_ENGINE)
+    window.set_selection_mode_selection(config.SELECTION_MODE)
 
-    hotkeys = capture.HotkeyListener(on_capture=app.on_capture, on_toggle=app.on_toggle, on_quit=app.on_quit)
+    if config.BOX_WIDTH_PX is not None and config.BOX_HEIGHT_PX is not None:
+        window.set_box_size_label(f"Box size: {config.BOX_WIDTH_PX}x{config.BOX_HEIGHT_PX}px")
+    else:
+        window.log('Set your item box size first ("Set Item Box Size..." button) before scanning.')
+    window.log("WF-PriceTracker ready. Loading item catalog...")
+    if config.OCR_ENGINE == "easyocr":
+        window.log("(First EasyOCR run will download its model weights - needs internet, one-time.)")
+
+    hotkeys = scan.HotkeyListener(on_scan=app.on_scan, on_toggle_scan=app.on_toggle_scan, on_quit=app.on_quit)
     hotkeys.start()
 
     icon = app.build_tray()

@@ -218,6 +218,9 @@ __marimo__/
 .streamlit/secrets.toml
 
 # WF-PriceTracker runtime data (screenshots, output, caches, logs)
+# data/cache/ is also where the Anthropic API key lives (data/cache/api_key.json,
+# via config.save_anthropic_api_key) - never put a real key in a tracked file
+# like wf_pricer/config.py instead.
 data/captures/*
 data/output/*
 data/cache/*
@@ -226,3 +229,8 @@ data/logs/*
 !data/output/.gitkeep
 !data/cache/.gitkeep
 !data/logs/.gitkeep
+
+# API keys / secrets, in case one ever ends up outside data/cache/
+*.key
+*api_key*
+secrets.json

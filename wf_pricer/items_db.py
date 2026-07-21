@@ -25,13 +25,24 @@ class Item:
 
 
 class ItemsIndex:
-    """In-memory index of all tradable items, backed by an on-disk cache."""
+    """In-memory index of all tradable items, backed by an on-disk cache.
+
+    Deliberately excludes "Set" listings (warframe.market tags these with
+    "set", e.g. "Fluctus Prime Set"). A Set is a trading bundle representing
+    a full collection of parts + blueprint sold as one lot - it never
+    appears as its own entry in your actual in-game inventory (you only
+    ever see the individual blueprint pieces: Barrel, Stock, Receiver, ...).
+    Without this, a short "X Set" name can out-score the correct, longer
+    individual part name on plain string similarity, which was causing
+    real mismatches (e.g. OCR'd "Fluctus Prime Stock" matching to
+    "Fluctus Prime Set" instead of "Fluctus Prime Stock Blueprint").
+    """
 
     def __init__(self, items: list[Item]):
-        self._items = items
+        self._items = [it for it in items if "set" not in it.tags]
         # rapidfuzz wants a flat sequence of choices to score against;
         # keep a parallel list of Item objects to map matches back.
-        self._names = [it.name for it in items]
+        self._names = [it.name for it in self._items]
 
     def __len__(self) -> int:
         return len(self._items)
@@ -41,20 +52,31 @@ class ItemsIndex:
 
         Returns None if nothing clears the configured confidence cutoff -
         this is what keeps UI chrome ("INVENTORY", "SORT BY", ...) from
-        being reported as items.
+        being reported as items. Also returns None if the top two
+        candidates are too close to call (see FUZZY_MATCH_MIN_MARGIN) -
+        e.g. OCR text missing an item's part-specific last word ties
+        equally against every part of that frame/weapon, and guessing one
+        anyway means silently reporting the wrong item.
         """
         text = text.strip()
         if len(text) < config.OCR_MIN_TEXT_LEN:
             return None
-        result = process.extractOne(
+        results = process.extract(
             text,
             self._names,
             scorer=fuzz.WRatio,
             score_cutoff=config.FUZZY_MATCH_SCORE_CUTOFF,
+            limit=2,
         )
-        if result is None:
+        if not results:
             return None
-        _matched_name, _score, idx = result
+        if len(results) > 1 and results[0][1] - results[1][1] < config.FUZZY_MATCH_MIN_MARGIN:
+            log.info(
+                "Ambiguous match for %r: %r (%.1f) vs %r (%.1f) - refusing to guess",
+                text, results[0][0], results[0][1], results[1][0], results[1][1],
+            )
+            return None
+        _matched_name, _score, idx = results[0]
         return self._items[idx]
 
 
