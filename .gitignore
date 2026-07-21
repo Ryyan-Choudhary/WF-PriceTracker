@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# WF-PriceTracker runtime data (screenshots, output, caches, logs)
+data/captures/*
+data/output/*
+data/cache/*
+data/logs/*
+!data/captures/.gitkeep
+!data/output/.gitkeep
+!data/cache/.gitkeep
+!data/logs/.gitkeep

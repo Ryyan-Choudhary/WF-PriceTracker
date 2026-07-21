@@ -1,0 +1,6 @@
+pillow>=10.0
+pytesseract>=0.3.10
+pynput>=1.7
+pystray>=0.19
+rapidfuzz>=3.0
+requests>=2.31
