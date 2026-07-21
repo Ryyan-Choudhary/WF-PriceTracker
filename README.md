@@ -41,50 +41,6 @@ back. Quit fully via the Quit button, the tray menu, or `Ctrl+F10`.
 3. A `summary.txt` is also written into that output folder with every
    matched item, how many times it was seen, and a rough total.
 
-## Instant single-item lookup: Shift+drag
-
-For checking one item without running the whole batch capture/process
-flow: hold **Shift** and left-click-drag a small box around one item's name
-(anywhere on screen, any time the app is running), then release. A cyan box
-follows your drag, and a popup appears near where you released showing the
-item name and current average sell price, auto-dismissing after a few
-seconds (or click it to dismiss early). It's logged in the window too.
-
-This is independent of capture mode (F9/F10) - you can use it any time,
-including while a batch session is running.
-
-**Heads up:** this arms on Shift+Click globally, at all times the app is
-running - not just in-game. Shift+Click is also the standard Windows
-gesture for multi-selecting files/text/list items, so doing that elsewhere
-on your desktop will also trigger this (a plain click or tiny drag is
-ignored, so normal single Shift+Clicks are mostly unaffected, but a
-Shift+drag-selection in Explorer, for example, will pop up the lookup box
-too). This trade-off was a deliberate choice made when building this
-feature, not an oversight - if it gets annoying, say so and it can be
-changed to only arm while capture mode is on, or to a dedicated hotkey
-instead of Shift+Click.
-
-## Speeding up OCR: Calibrate Grid
-
-By default, OCR scans the entire screenshot, including all the icon artwork
-- which is slow and also the source of most false-positive garbage text.
-Warframe's inventory screens (Mods grid, Relics list, Prime Parts list, ...)
-all show item names in a narrow band near the bottom of each row/tile, so if
-you tell the app how tall one row is, it can blank out everything else
-before running OCR.
-
-Click **"Calibrate Grid..."** in the window (needs at least one screenshot
-captured first). It opens your most recent screenshot and asks you to drag a
-box from the top of one item's tile to the top of the tile directly below it
-in the same column - i.e. the box height should equal exactly one grid row.
-Click "Use this" and it's saved to `data/cache/grid_calibration.json`
-immediately, no restart needed. On a synthetic 1920x1080 grid this took OCR
-from ~5.1s down to ~1.7s per screenshot with no items lost.
-
-Since different screens (Mods vs. Relics vs. Prime Parts) have different row
-heights, you may need to recalibrate when you switch screens - click
-**"Clear"** next to it to go back to scanning the whole screenshot.
-
 ## Setup
 
 You need Python 3.11+ and the Tesseract OCR engine (a separate, non-Python
@@ -142,15 +98,14 @@ seems to silently fail, check there first.
 
 ```
 wf_pricer/
-  config.py     settings: hotkeys, folders, thresholds, API base URL, grid calibration
+  config.py     settings: hotkeys, folders, thresholds, API base URL
   capture.py    screenshot capture (async save) + global hotkey binding
-  ocr.py         image preprocessing, grid-band masking + Tesseract text/line extraction
+  ocr.py         image preprocessing + Tesseract text/line extraction
   items_db.py   warframe.market item catalog fetch/cache + fuzzy matching
   market.py     warframe.market order fetch/cache + price averaging
   annotate.py   draws price labels onto a screenshot
   pipeline.py   wires OCR -> matching -> pricing -> annotation together
-  snip.py       global Shift+drag detection (single-item instant lookup)
-  gui.py        the app window, calibration dialog, snip overlay + popup
+  gui.py        the app window (status, buttons, live log)
   tray.py       tray icon image
   main.py       app entry point (window + tray + hotkeys wiring)
 run.py / run.pyw  launchers (console / silent)
