@@ -30,6 +30,8 @@ back. Quit fully via the Quit button, the tray menu, or `Ctrl+F10`.
      Now"). Grabs a box of your configured size centered on the cursor,
      OCRs it, matches it, and shows the price in a popup next to your
      cursor (auto-dismisses, or click to dismiss early).
+![Screenshot1](gpage/singleselect.png)
+![Screenshot2](gpage/singleprice.png)
 
    **Multi-Select** (for scanning a whole batch at once):
    - While scan mode is on, left-click-drag a box around however many
@@ -38,6 +40,8 @@ back. Quit fully via the Quit button, the tray menu, or `Ctrl+F10`.
      each one gets a name+price label drawn directly over it on screen,
      added one at a time as each is found and priced. Labels stay up until
      the next drag (starting a new drag immediately clears the old ones).
+![Screenshot3](gpage/multiselect.png)
+![Screenshot4](gpage/multiprice.png)
 
    Either way: results are logged in the window, and appended to
    `data/logs/scans.txt` with a timestamp so you keep a running record
