@@ -76,8 +76,12 @@ class AppWindow:
 
         self.root = tk.Tk()
         self.root.title("WF-PriceTracker")
-        self.root.geometry("520x700")
-        self.root.minsize(440, 560)
+        # Default is tall enough to show the whole page without a scrollbar
+        # (content is ~665px + the pinned footer); the scrollbar only appears
+        # once the user shrinks below that. The content scrolls, so the floor
+        # just has to keep the header, tabs and footer legible.
+        self.root.geometry("520x760")
+        self.root.minsize(360, 400)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -92,6 +96,9 @@ class AppWindow:
         self._current_engine_key = "tesseract"
         self._tabs: dict[str, tuple[tk.Label, tk.Frame]] = {}
         self._panels: dict[str, tk.Frame] = {}
+        # (label, width_margin) pairs whose wraplength tracks the window width
+        # so copy re-wraps instead of overflowing when the window is narrowed.
+        self._wrap_labels: list[tuple[tk.Label, int]] = []
 
         self._on_toggle_scan = on_toggle_scan
         self._on_scan_now = on_scan_now
@@ -228,17 +235,122 @@ class AppWindow:
         )
 
     def _build_widgets(self) -> None:
-        self._build_header()
-        self._build_tab_bar()
-        self._build_mode_panels()
-        self._build_actions()
-        self._build_settings()
-        self._build_log()
-        self._build_footer()
+        # The footer (Quit, always-on-top, hint) is pinned to the bottom of
+        # the window OUTSIDE the scroll area, so it stays put no matter how
+        # short the window gets - it was the first thing to fall off the
+        # bottom before. Everything else lives in a vertically scrollable
+        # region so a small window just gains a scrollbar instead of clipping.
+        self._build_footer(self.root)
+        content = self._build_scroll_area(self.root)
+
+        self._build_header(content)
+        self._build_tab_bar(content)
+        self._build_mode_panels(content)
+        self._build_actions(content)
+        self._build_settings(content)
+        self._build_log(content)
         self._apply_mode_ui(self.selection_mode_var.get())
 
-    def _build_header(self) -> None:
-        header = tk.Frame(self.root, bg=BG)
+    # --- scroll area ------------------------------------------------------
+    def _build_scroll_area(self, parent: tk.Misc) -> tk.Frame:
+        """A canvas-backed vertical scroller. Returns the inner frame that all
+        the page content packs into.
+
+        The inner frame is stretched to the canvas WIDTH (so horizontal fill
+        still works) and to at least the canvas HEIGHT: when the window is
+        tall, the extra height flows into the activity log (which packs with
+        expand), so there's no dead space; when the window is short, the inner
+        frame keeps its natural height and the canvas scrolls.
+        """
+        wrap = tk.Frame(parent, bg=BG)
+        wrap.pack(side="top", fill="both", expand=True)
+
+        canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
+        self._scroll_canvas = canvas
+        self._scroll_bar = ttk.Scrollbar(
+            wrap, orient="vertical", command=canvas.yview, style="Dark.Vertical.TScrollbar"
+        )
+        self._scroll_bar_shown = False
+        canvas.configure(yscrollcommand=self._scroll_bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=BG)
+        self._scroll_inner = inner
+        self._scroll_win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        self._reflow_pending = False
+        inner.bind("<Configure>", lambda _e: self._schedule_reflow())
+        canvas.bind("<Configure>", lambda _e: self._schedule_reflow())
+        # One global wheel binding, routed in the handler (the activity log
+        # scrolls itself when hovered; everywhere else scrolls the page).
+        canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        return inner
+
+    # Width the vertical scrollbar takes when shown. Reserved from the wrap
+    # width at ALL times so toggling the bar never changes how text wraps -
+    # if it did, showing the bar could add a line, which could re-trigger the
+    # bar, which is exactly the oscillation this avoids.
+    _SCROLLBAR_RESERVE = 16
+
+    def _schedule_reflow(self) -> None:
+        """Coalesce the flurry of <Configure> events a resize emits into one
+        reflow, run once the layout has settled (after_idle). Measuring
+        mid-resize reads half-applied geometry - which is how the scrollbar
+        got stuck visible on a window that actually fit.
+        """
+        if self._reflow_pending:
+            return
+        self._reflow_pending = True
+        self.root.after_idle(self._reflow_scroll)
+
+    def _reflow_scroll(self) -> None:
+        self._reflow_pending = False
+        canvas = self._scroll_canvas
+        cw = canvas.winfo_width()
+        ch = canvas.winfo_height()
+
+        # Wrap against the width the content gets WITH the scrollbar present,
+        # regardless of whether it currently is, so `need` is stable. When the
+        # bar is already shown `cw` excludes it; when not, subtract the reserve.
+        wrap_w = cw - (0 if self._scroll_bar_shown else self._SCROLLBAR_RESERVE)
+        for label, margin in self._wrap_labels:
+            label.configure(wraplength=max(160, wrap_w - margin))
+
+        need = self._scroll_inner.winfo_reqheight()
+        # Match the inner frame to the canvas width, and to whichever is taller
+        # of (its content, the visible canvas) so the log fills spare height.
+        canvas.itemconfigure(self._scroll_win, width=cw, height=max(need, ch))
+        canvas.configure(scrollregion=(0, 0, cw, max(need, ch)))
+
+        # Only show the scrollbar when there's actually something below the
+        # fold; a dead scrollbar on a roomy window is just clutter.
+        overflowing = need > ch + 1
+        if overflowing and not self._scroll_bar_shown:
+            self._scroll_bar.pack(side="right", fill="y")
+            self._scroll_bar_shown = True
+        elif not overflowing and self._scroll_bar_shown:
+            self._scroll_bar.pack_forget()
+            self._scroll_bar_shown = False
+            canvas.yview_moveto(0)
+
+    def _on_mousewheel(self, event: tk.Event) -> object:
+        if not self._scroll_bar_shown:
+            return None  # nothing to scroll
+        under = self.root.winfo_containing(event.x_root, event.y_root)
+        node = under
+        while node is not None:
+            if node is self.log_box:
+                return None  # let the listbox's own wheel binding handle it
+            if node is self._scroll_canvas or node is self._scroll_inner:
+                break
+            node = getattr(node, "master", None)
+        else:
+            return None  # pointer isn't over the scroll area
+        self._scroll_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        return "break"
+
+    def _build_header(self, parent: tk.Misc) -> None:
+        header = tk.Frame(parent, bg=BG)
         header.pack(fill="x", padx=16, pady=(14, 10))
         tk.Label(
             header, text="WF-PriceTracker", bg=BG, fg=TEXT, font=(FONT, 15, "bold")
@@ -254,12 +366,12 @@ class AppWindow:
             pill, textvariable=self.status_var, bg=SURFACE, fg=TEXT, font=(FONT, 9, "bold")
         ).pack(side="left", padx=(0, 10), pady=3)
 
-    def _build_tab_bar(self) -> None:
+    def _build_tab_bar(self, parent: tk.Misc) -> None:
         """The three selection modes as a tab strip. Picking a tab IS picking
         the mode - there's no separate mode control anymore, so the tab a user
         is looking at always matches what F9/F10 will actually do.
         """
-        bar = tk.Frame(self.root, bg=BG)
+        bar = tk.Frame(parent, bg=BG)
         bar.pack(fill="x", padx=16)
         for mode, label in self._MODE_TABS:
             holder = tk.Frame(bar, bg=BG)
@@ -279,10 +391,10 @@ class AppWindow:
             tab.bind("<Leave>", lambda _e, m=mode: self._on_tab_hover(m, False))
             self._tabs[mode] = (tab, underline)
 
-    def _build_mode_panels(self) -> None:
+    def _build_mode_panels(self, parent: tk.Misc) -> None:
         """One card per mode, holding ONLY that mode's own settings. Exactly
         one is packed at a time (see _apply_mode_ui)."""
-        self._panel_host = tk.Frame(self.root, bg=BG)
+        self._panel_host = tk.Frame(parent, bg=BG)
         self._panel_host.pack(fill="x", padx=16, pady=(12, 0))
 
         self._panels["single"] = self._build_single_panel()
@@ -293,10 +405,13 @@ class AppWindow:
         """Shared shell for a mode panel: an explanatory line plus a body
         frame for that mode's own controls. Returns (card, body)."""
         card = tk.Frame(self._panel_host, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
-        tk.Label(
+        blurb_label = tk.Label(
             card, text=blurb, bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9),
             wraplength=430, justify="left", anchor="w",
-        ).pack(fill="x", padx=14, pady=(12, 0))
+        )
+        blurb_label.pack(fill="x", padx=14, pady=(12, 0))
+        # ~32px inside-card padding + 16px page padding on each side.
+        self._wrap_labels.append((blurb_label, 64))
         body = tk.Frame(card, bg=SURFACE)
         body.pack(fill="x", padx=14, pady=12)
         return card, body
@@ -342,8 +457,8 @@ class AppWindow:
         self._stat_row(body, "Grid:", self.grid_info_var)
         return card
 
-    def _build_actions(self) -> None:
-        actions = tk.Frame(self.root, bg=BG)
+    def _build_actions(self, parent: tk.Misc) -> None:
+        actions = tk.Frame(parent, bg=BG)
         actions.pack(fill="x", padx=16, pady=(12, 0))
         self.toggle_btn = self._button(
             actions, "Start Scan Mode (F10)", self._on_toggle_scan, primary=True,
@@ -354,9 +469,9 @@ class AppWindow:
             side="left", expand=True, fill="x", padx=(5, 0),
         )
 
-    def _build_settings(self) -> None:
-        self._section_label(self.root, "Settings").pack(fill="x", padx=16, pady=(16, 4))
-        card = self._card(self.root, fill="x", padx=16)
+    def _build_settings(self, parent: tk.Misc) -> None:
+        self._section_label(parent, "Settings").pack(fill="x", padx=16, pady=(16, 4))
+        card = self._card(parent, fill="x", padx=16)
 
         engine_row = tk.Frame(card, bg=SURFACE)
         engine_row.pack(fill="x", padx=14, pady=(12, 0))
@@ -385,11 +500,13 @@ class AppWindow:
             command=self._on_price_workers_scale,
         )
         self.price_workers_scale.pack(fill="x", pady=(4, 0))
-        tk.Label(
+        speed_hint = tk.Label(
             speed_row,
             text="Higher = faster scans, but warframe.market may rate-limit your IP above ~3.",
             bg=SURFACE, fg=TEXT_DIM, font=(FONT, 8), wraplength=430, justify="left", anchor="w",
-        ).pack(fill="x", pady=(4, 0))
+        )
+        speed_hint.pack(fill="x", pady=(4, 0))
+        self._wrap_labels.append((speed_hint, 64))
 
         key_row = tk.Frame(card, bg=SURFACE)
         key_row.pack(fill="x", padx=14, pady=12)
@@ -409,12 +526,15 @@ class AppWindow:
         self._set_button_enabled(self.anthropic_key_btn, False)
         self._set_button_enabled(self.google_key_btn, False)
 
-    def _build_log(self) -> None:
-        self._section_label(self.root, "Activity").pack(fill="x", padx=16, pady=(16, 4))
-        log_frame = tk.Frame(self.root, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
-        log_frame.pack(fill="both", expand=True, padx=16)
+    def _build_log(self, parent: tk.Misc) -> None:
+        self._section_label(parent, "Activity").pack(fill="x", padx=16, pady=(16, 4))
+        log_frame = tk.Frame(parent, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        # expand=True so the log soaks up the spare height the scroll area
+        # hands down on a tall window; height=4 keeps its *minimum* small so a
+        # short window scrolls rather than being dominated by the log.
+        log_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
         self.log_box = tk.Listbox(
-            log_frame, font=(MONO, 9), activestyle="none",
+            log_frame, font=(MONO, 9), activestyle="none", height=4,
             bg=SURFACE, fg=TEXT_DIM, selectbackground=SURFACE_HI, selectforeground=TEXT,
             relief="flat", bd=0, highlightthickness=0,
         )
@@ -425,9 +545,15 @@ class AppWindow:
         self.log_box.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         scrollbar.pack(side="right", fill="y", pady=6, padx=(0, 4))
 
-    def _build_footer(self) -> None:
-        bottom = tk.Frame(self.root, bg=BG)
-        bottom.pack(fill="x", padx=16, pady=12)
+    def _build_footer(self, parent: tk.Misc) -> None:
+        # side="bottom" pins this below the scroll area, so Quit and the
+        # always-on-top toggle are reachable at every window size. A hairline
+        # on top separates it from the scrolling content above.
+        shell = tk.Frame(parent, bg=BG)
+        shell.pack(side="bottom", fill="x")
+        tk.Frame(shell, bg=BORDER, height=1).pack(fill="x")
+        bottom = tk.Frame(shell, bg=BG)
+        bottom.pack(fill="x", padx=16, pady=10)
         tk.Checkbutton(
             bottom, text="Always on top", variable=self.topmost_var, command=self._apply_topmost,
             bg=BG, fg=TEXT_DIM, selectcolor=SURFACE_HI, activebackground=BG, activeforeground=TEXT,
