@@ -195,15 +195,28 @@ seems to silently fail, check there first.
   your actual inventory (you only ever see the individual pieces: Barrel,
   Stock, Chassis Blueprint, etc.), so it's never offered as a possible scan
   match, regardless of how the catalog was loaded.
-- **If the top two candidate matches are too close in score, the app
-  refuses to guess** rather than silently reporting the wrong item - e.g.
-  OCR text that's missing an item's part-specific last word (say, just
-  "Titania Prime" instead of "Titania Prime Blueprint") ties equally
-  against every part of that frame. You'll see "No item recognized" in that
-  case instead of a wrong price. Warframe often wraps a long name across 2
-  lines within one tile - both scan modes already reconstruct that wrapped
-  name automatically, so this mostly shows up if a box/region genuinely
-  doesn't capture the full name.
+- **Matching is two-stage, anchored on the item's base name.** Rather than
+  scoring the OCR text against all ~3,600 names at once, it first works out
+  which item *family* the text belongs to by matching each word against the
+  set of base names ("atlas", "bronco", "serration"), then ranks only that
+  family's items. The base name is the most distinctive part and usually
+  survives OCR intact, which is what keeps a garbled middle from drifting
+  to an unrelated item that merely shares generic words - e.g.
+  `wy Atlas Pfime'thassis Blueprint` correctly resolves to *Atlas Prime
+  Chassis Blueprint* instead of being dragged to "Wyrm Prime Blueprint" by
+  the shared "Prime Blueprint". Punctuation is treated as a word separator
+  too, so an OCR artifact fusing two words (`Pfime'thassis`) still splits
+  back into matchable pieces. Matching is also ~0.6 ms per lookup.
+- **If the top two candidate matches are still too close, the app refuses
+  to guess** rather than silently reporting the wrong item - e.g. OCR text
+  missing an item's part-specific last word (just "Titania Prime" instead
+  of "Titania Prime Blueprint") ties equally against every part of that
+  frame. You'll see "No item recognized" instead of a wrong price. An exact
+  read - or the same words in a different order - bypasses this, since
+  that's unambiguous. Warframe often wraps a long name across 2 lines
+  within one tile; all scan modes reconstruct that wrapped name
+  automatically, so this mostly shows up if a box/region genuinely doesn't
+  capture the full name.
 - **Scan speed depends on which engine you picked** - see the **OCR Engine**
   section above.
 - **Grid Scan tuning.** Recalibrate ("Calibrate Grid...") whenever the
@@ -238,7 +251,7 @@ wf_pricer/
   config.py     settings: hotkeys, folders, box size, grid calibration, selection mode, OCR engine + API key storage
   scan.py       screen grabs (cursor box / region / multi-frame), global hotkeys, cursor tracking, drag-select watcher
   ocr.py        Tesseract / EasyOCR / Claude / Gemini engines + Grid Scan name-band preprocessing & montage reader
-  items_db.py   warframe.market item catalog fetch/cache + fuzzy matching (excludes Sets, refuses ambiguous ties)
+  items_db.py   catalog fetch/cache + two-stage anchored matching (base-name families, excludes Sets, refuses ties)
   market.py     warframe.market order fetch/cache (thread-safe) + concurrent get_prices + price averaging
   pipeline.py   price_crop (single) / price_region (multi) / price_grid (grid) - concurrent pricing, parallel grid OCR
   gui.py        app window + overlays (calibration, cursor box, grid outline, multi-result labels, result popup)

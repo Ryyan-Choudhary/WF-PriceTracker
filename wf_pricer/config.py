@@ -379,6 +379,18 @@ FUZZY_MATCH_SCORE_CUTOFF = 84  # 0-100, higher = stricter (fewer false positives
 # parts, and picking one anyway means silently reporting the wrong item.
 FUZZY_MATCH_MIN_MARGIN = 3
 
+# Matching runs in two stages (see items_db.ItemsIndex.match):
+#   1. ANCHOR - find which item "families" the text could belong to, by
+#      fuzzy-matching each word of the OCR text against the set of base
+#      names (the first word of every item, e.g. "atlas", "bronco").
+#   2. RANK   - score the full text only against that family's items.
+# Anchoring on the distinctive base name is what stops a garbled middle
+# ("Atlas Pfime'thassis Blueprint") from being dragged off to an unrelated
+# item that happens to share generic words like "Prime Blueprint".
+FUZZY_ANCHOR_SCORE_CUTOFF = 78  # how close a word must be to a base name to pull in that family
+FUZZY_ANCHOR_MIN_TOKEN_LEN = 3  # ignore tiny OCR specks ("O2", "a", "4") when anchoring
+FUZZY_ANCHOR_MAX_FAMILIES = 6   # families pulled in per word of the text
+
 # --- Pricing -----------------------------------------------------------
 # How many of the cheapest current sell orders to average together.
 PRICE_SAMPLE_SIZE = 5
