@@ -2,7 +2,7 @@
 
 Tkinter isn't thread-safe, so every widget mutation has to happen on the Tk
 thread. Other threads (the pynput hotkey thread, the background scan-worker
-thread) only ever call the thread-safe methods here (log/set_status/etc),
+thread) only ever call the thread-safe methods here (log/set_scan_active/etc),
 which either push onto a queue.Queue the Tk mainloop polls, or schedule a
 callback via root.after(0, ...).
 """
@@ -15,7 +15,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable
 
-from pynput import mouse
+from pynput import keyboard, mouse
 
 from . import config
 from .scan import virtual_screen_rect
@@ -44,6 +44,69 @@ FONT = "Segoe UI"
 MONO = "Consolas"
 
 
+# --- Hotkey formatting ------------------------------------------------------
+# Hotkeys are stored in pynput GlobalHotKeys syntax ("<ctrl>+<f10>", "<f9>",
+# "a"); these turn that into something a person reads ("Ctrl + F10").
+_HK_MOD_ORDER = ("ctrl", "alt", "shift", "cmd")
+_HK_PRETTY = {
+    "ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "cmd": "Win",
+    "space": "Space", "esc": "Esc", "enter": "Enter", "tab": "Tab",
+    "backspace": "Backspace", "delete": "Del", "insert": "Ins",
+    "home": "Home", "end": "End", "page_up": "PgUp", "page_down": "PgDn",
+    "up": "↑", "down": "↓", "left": "←", "right": "→",
+}
+
+
+def hotkey_label(hotkey: str) -> str:
+    """Human-readable form of a pynput hotkey string, e.g. '<ctrl>+<f10>' ->
+    'Ctrl + F10'. Falls back to the raw token for anything unrecognised (a
+    bare virtual-key code shows as e.g. 'Key 220')."""
+    parts = []
+    for token in hotkey.split("+"):
+        token = token.strip()
+        if token.startswith("<") and token.endswith(">"):
+            name = token[1:-1]
+            if name in _HK_PRETTY:
+                parts.append(_HK_PRETTY[name])
+            elif name.isdigit():
+                parts.append(f"Key {name}")
+            else:
+                parts.append(name.upper() if len(name) <= 3 else name.capitalize())
+        else:
+            parts.append(token.upper())
+    return " + ".join(parts) if parts else "(unset)"
+
+
+# Maps every pynput modifier Key variant (ctrl / ctrl_l / ctrl_r / ...) to the
+# canonical GlobalHotKeys token, so a captured combo comes out in the same
+# syntax the listener is configured with.
+_HK_MOD_MAP: dict = {}
+for _name, _tok in (("ctrl", "<ctrl>"), ("alt", "<alt>"), ("shift", "<shift>"), ("cmd", "<cmd>")):
+    for _suffix in ("", "_l", "_r", "_gr"):
+        _key = getattr(keyboard.Key, _name + _suffix, None)
+        if _key is not None:
+            _HK_MOD_MAP[_key] = _tok
+_HK_MOD_TOKEN_ORDER = [f"<{m}>" for m in _HK_MOD_ORDER]
+
+
+def _hk_key_token(key) -> str | None:
+    """Canonical GlobalHotKeys token for a pynput key, or None to ignore it.
+
+    Modifiers -> '<ctrl>' etc; named keys (F9, Esc) -> '<f9>'; printable chars
+    -> the lowercased char; anything else (dead/control chars) -> its virtual
+    key code '<220>', which GlobalHotKeys still matches even when the char is
+    swallowed by a held modifier."""
+    if key in _HK_MOD_MAP:
+        return _HK_MOD_MAP[key]
+    if isinstance(key, keyboard.Key):
+        return f"<{key.name}>"
+    char = getattr(key, "char", None)
+    if char and char.isprintable() and not char.isspace():
+        return char.lower()
+    vk = getattr(key, "vk", None)
+    return f"<{vk}>" if vk is not None else None
+
+
 class AppWindow:
     _ENGINE_OPTIONS = [
         ("easyocr", "EasyOCR (accurate, slower)"),
@@ -52,11 +115,15 @@ class AppWindow:
         ("gemini_vision", "Gemini Vision (in development)"),
     ]
 
-    _MODE_TABS = [
+    # The tab strip. The first three are scan modes; "settings" is a plain
+    # page (see _active_tab). Kept in one list so they render as one strip.
+    _TAB_DEFS = [
         ("single", "Single"),
         ("multi", "Multi-Select"),
         ("grid", "Grid Scan"),
+        ("settings", "Settings"),
     ]
+    _MODE_TABS = ("single", "multi", "grid")
 
     def __init__(
         self,
@@ -70,6 +137,8 @@ class AppWindow:
         on_selection_mode_change: Callable[[str], None],
         on_calibrate_grid: Callable[[], None],
         on_price_workers_change: Callable[[int], None],
+        on_set_hotkey: Callable[[str, str], None],
+        on_hotkey_capture_start: Callable[[], None],
         on_quit: Callable[[], None],
     ) -> None:
         self._log_queue: "queue.Queue[str]" = queue.Queue()
@@ -96,9 +165,23 @@ class AppWindow:
         self._current_engine_key = "tesseract"
         self._tabs: dict[str, tuple[tk.Label, tk.Frame]] = {}
         self._panels: dict[str, tk.Frame] = {}
+        # Which tab's panel is showing. Distinct from selection_mode_var: the
+        # Settings tab is NOT a scan mode, so opening it must not change what
+        # F9/F10 do. selection_mode_var stays put; only _active_tab moves.
+        self._active_tab = "single"
         # (label, width_margin) pairs whose wraplength tracks the window width
         # so copy re-wraps instead of overflowing when the window is narrowed.
         self._wrap_labels: list[tuple[tk.Label, int]] = []
+        # Hotkey display state (see set_hotkey_labels). Seeded from config so
+        # the labels are right on first paint, before main pushes anything.
+        self._hk_labels = {
+            "scan": hotkey_label(config.HOTKEY_SCAN),
+            "toggle": hotkey_label(config.HOTKEY_TOGGLE_SCAN),
+            "quit": hotkey_label(config.HOTKEY_QUIT),
+        }
+        self._hk_vars = {k: tk.StringVar(value=v) for k, v in self._hk_labels.items()}
+        self._scan_active = False
+        self._result_popup: "ResultPopup | None" = None
 
         self._on_toggle_scan = on_toggle_scan
         self._on_scan_now = on_scan_now
@@ -110,6 +193,8 @@ class AppWindow:
         self._on_selection_mode_change = on_selection_mode_change
         self._on_calibrate_grid = on_calibrate_grid
         self._on_price_workers_change = on_price_workers_change
+        self._on_set_hotkey = on_set_hotkey
+        self._on_hotkey_capture_start = on_hotkey_capture_start
         self._on_quit = on_quit
 
         self._init_style()
@@ -247,9 +332,8 @@ class AppWindow:
         self._build_tab_bar(content)
         self._build_mode_panels(content)
         self._build_actions(content)
-        self._build_settings(content)
         self._build_log(content)
-        self._apply_mode_ui(self.selection_mode_var.get())
+        self._apply_active_tab(self._active_tab)
 
     # --- scroll area ------------------------------------------------------
     def _build_scroll_area(self, parent: tk.Misc) -> tk.Frame:
@@ -367,13 +451,13 @@ class AppWindow:
         ).pack(side="left", padx=(0, 10), pady=3)
 
     def _build_tab_bar(self, parent: tk.Misc) -> None:
-        """The three selection modes as a tab strip. Picking a tab IS picking
-        the mode - there's no separate mode control anymore, so the tab a user
-        is looking at always matches what F9/F10 will actually do.
+        """The tab strip: three scan modes plus Settings. Clicking a mode tab
+        selects that scan mode AND shows its panel; clicking Settings only
+        shows the settings panel (the active scan mode is left untouched).
         """
         bar = tk.Frame(parent, bg=BG)
         bar.pack(fill="x", padx=16)
-        for mode, label in self._MODE_TABS:
+        for key, label in self._TAB_DEFS:
             holder = tk.Frame(bar, bg=BG)
             holder.pack(side="left", expand=True, fill="x")
             tab = tk.Label(
@@ -386,20 +470,21 @@ class AppWindow:
             # tabs doesn't shift the layout by 2px.
             underline = tk.Frame(holder, bg=BORDER, height=2)
             underline.pack(fill="x")
-            tab.bind("<Button-1>", lambda _e, m=mode: self._on_tab_clicked(m))
-            tab.bind("<Enter>", lambda _e, m=mode: self._on_tab_hover(m, True))
-            tab.bind("<Leave>", lambda _e, m=mode: self._on_tab_hover(m, False))
-            self._tabs[mode] = (tab, underline)
+            tab.bind("<Button-1>", lambda _e, k=key: self._on_tab_clicked(k))
+            tab.bind("<Enter>", lambda _e, k=key: self._on_tab_hover(k, True))
+            tab.bind("<Leave>", lambda _e, k=key: self._on_tab_hover(k, False))
+            self._tabs[key] = (tab, underline)
 
     def _build_mode_panels(self, parent: tk.Misc) -> None:
         """One card per mode, holding ONLY that mode's own settings. Exactly
-        one is packed at a time (see _apply_mode_ui)."""
+        one is packed at a time (see _apply_active_tab)."""
         self._panel_host = tk.Frame(parent, bg=BG)
         self._panel_host.pack(fill="x", padx=16, pady=(12, 0))
 
         self._panels["single"] = self._build_single_panel()
         self._panels["multi"] = self._build_multi_panel()
         self._panels["grid"] = self._build_grid_panel()
+        self._panels["settings"] = self._build_settings_panel()
 
     def _panel_body(self, blurb: str) -> tuple[tk.Frame, tk.Frame]:
         """Shared shell for a mode panel: an explanatory line plus a body
@@ -460,64 +545,85 @@ class AppWindow:
     def _build_actions(self, parent: tk.Misc) -> None:
         actions = tk.Frame(parent, bg=BG)
         actions.pack(fill="x", padx=16, pady=(12, 0))
+        self._actions_frame = actions  # hidden on the Settings tab
         self.toggle_btn = self._button(
-            actions, "Start Scan Mode (F10)", self._on_toggle_scan, primary=True,
+            actions, self._toggle_btn_text(), self._on_toggle_scan, primary=True,
             side="left", expand=True, fill="x", padx=(0, 5),
         )
         self.scan_now_btn = self._button(
-            actions, "Scan Now (F9)", self._on_scan_now,
+            actions, self._scan_btn_text(), self._on_scan_now,
             side="left", expand=True, fill="x", padx=(5, 0),
         )
 
-    def _build_settings(self, parent: tk.Misc) -> None:
-        self._section_label(parent, "Settings").pack(fill="x", padx=16, pady=(16, 4))
-        card = self._card(parent, fill="x", padx=16)
+    def _toggle_btn_text(self) -> str:
+        verb = "Stop" if self._scan_active else "Start"
+        return f"{verb} Scan Mode ({self._hk_labels['toggle']})"
 
-        engine_row = tk.Frame(card, bg=SURFACE)
-        engine_row.pack(fill="x", padx=14, pady=(12, 0))
-        tk.Label(engine_row, text="OCR engine", bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9)).pack(anchor="w")
+    def _scan_btn_text(self) -> str:
+        return f"Scan Now ({self._hk_labels['scan']})"
+
+    _HK_ACTION_NAMES = {"toggle": "Toggle scan mode", "scan": "Scan now", "quit": "Quit app"}
+
+    def _settings_subhead(self, parent: tk.Misc, text: str, first: bool = False) -> None:
+        """A divider + small caps heading to group the settings card into
+        sections (OCR / hotkeys / catalog)."""
+        if not first:
+            tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", pady=(14, 0))
+        tk.Label(
+            parent, text=text.upper(), bg=SURFACE, fg=TEXT_DIM,
+            font=(FONT, 8, "bold"), anchor="w",
+        ).pack(fill="x", pady=(12, 2))
+
+    def _build_settings_panel(self) -> tk.Frame:
+        """The Settings tab's panel: OCR engine, price concurrency, rebindable
+        hotkeys, and catalog/key actions - the app-wide controls that don't
+        belong to any one scan mode."""
+        card = tk.Frame(self._panel_host, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        body = tk.Frame(card, bg=SURFACE)
+        body.pack(fill="x", padx=14, pady=(2, 12))
+
+        # --- OCR engine + speed ---
+        self._settings_subhead(body, "OCR & speed", first=True)
+        tk.Label(body, text="OCR engine", bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9)).pack(anchor="w")
         self.engine_combo = ttk.Combobox(
-            engine_row,
-            textvariable=self.engine_var,
-            values=[label for _key, label in self._ENGINE_OPTIONS],
-            state="readonly",
+            body, textvariable=self.engine_var,
+            values=[label for _key, label in self._ENGINE_OPTIONS], state="readonly",
         )
         self.engine_combo.pack(fill="x", pady=(4, 0))
         self.engine_combo.bind("<<ComboboxSelected>>", self._on_engine_selected)
 
-        speed_row = tk.Frame(card, bg=SURFACE)
-        speed_row.pack(fill="x", padx=14, pady=(12, 0))
         tk.Label(
-            speed_row, textvariable=self.price_workers_label_var,
+            body, textvariable=self.price_workers_label_var,
             bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9),
-        ).pack(anchor="w")
+        ).pack(anchor="w", pady=(12, 0))
         self.price_workers_scale = ttk.Scale(
-            speed_row,
-            from_=config.PRICE_FETCH_WORKERS_MIN,
-            to=config.PRICE_FETCH_WORKERS_MAX,
-            orient="horizontal",
-            style="Accent.Horizontal.TScale",
-            command=self._on_price_workers_scale,
+            body, from_=config.PRICE_FETCH_WORKERS_MIN, to=config.PRICE_FETCH_WORKERS_MAX,
+            orient="horizontal", style="Accent.Horizontal.TScale", command=self._on_price_workers_scale,
         )
         self.price_workers_scale.pack(fill="x", pady=(4, 0))
         speed_hint = tk.Label(
-            speed_row,
-            text="Higher = faster scans, but warframe.market may rate-limit your IP above ~3.",
+            body, text="Higher = faster scans, but warframe.market may rate-limit your IP above ~3.",
             bg=SURFACE, fg=TEXT_DIM, font=(FONT, 8), wraplength=430, justify="left", anchor="w",
         )
         speed_hint.pack(fill="x", pady=(4, 0))
         self._wrap_labels.append((speed_hint, 64))
 
-        key_row = tk.Frame(card, bg=SURFACE)
-        key_row.pack(fill="x", padx=14, pady=12)
-        self._button(key_row, "Refresh Item List", self._on_refresh_catalog,
-                     side="left", expand=True, fill="x", padx=(0, 5))
+        # --- Hotkeys ---
+        self._settings_subhead(body, "Hotkeys")
+        for action in ("toggle", "scan", "quit"):
+            self._hotkey_row(body, action)
+
+        # --- Catalog / keys ---
+        self._settings_subhead(body, "Catalog & API keys")
+        self._button(body, "Refresh Item List", self._on_refresh_catalog, fill="x")
+        key_row = tk.Frame(body, bg=SURFACE)
+        key_row.pack(fill="x", pady=(6, 0))
         # Disabled for now - Claude/Gemini Vision are still in development
         # (see config.DISABLED_ENGINES). Re-enabling these is just dropping
         # the _set_button_enabled(False) calls once those engines are ready.
         self.anthropic_key_btn = self._button(
             key_row, "Anthropic Key…", self._prompt_anthropic_key,
-            side="left", expand=True, fill="x", padx=(5, 5),
+            side="left", expand=True, fill="x", padx=(0, 5),
         )
         self.google_key_btn = self._button(
             key_row, "Google Key…", self._prompt_google_key,
@@ -525,9 +631,34 @@ class AppWindow:
         )
         self._set_button_enabled(self.anthropic_key_btn, False)
         self._set_button_enabled(self.google_key_btn, False)
+        return card
+
+    def _hotkey_row(self, parent: tk.Misc, action: str) -> None:
+        row = tk.Frame(parent, bg=SURFACE)
+        row.pack(fill="x", pady=(8, 0))
+        tk.Label(
+            row, text=self._HK_ACTION_NAMES[action], bg=SURFACE, fg=TEXT, font=(FONT, 9)
+        ).pack(side="left")
+        self._button(row, "Change…", lambda a=action: self._change_hotkey(a), side="right")
+        tk.Label(
+            row, textvariable=self._hk_vars[action], bg=SURFACE, fg=ACCENT, font=(FONT, 9, "bold")
+        ).pack(side="right", padx=10)
+
+    def _change_hotkey(self, action: str) -> None:
+        # Suspend global hotkeys while capturing so the keys being pressed to
+        # rebind don't also fire the action they're bound to (see App).
+        self._on_hotkey_capture_start()
+        HotkeyCaptureDialog(
+            self.root,
+            title=f"Rebind: {self._HK_ACTION_NAMES[action]}",
+            on_result=lambda hk, a=action: self._on_set_hotkey(a, hk),
+        )
 
     def _build_log(self, parent: tk.Misc) -> None:
-        self._section_label(parent, "Activity").pack(fill="x", padx=16, pady=(16, 4))
+        # Kept as the re-pack anchor so the action bar always lands directly
+        # above the activity section when it's shown again.
+        self._activity_anchor = self._section_label(parent, "Activity")
+        self._activity_anchor.pack(fill="x", padx=16, pady=(16, 4))
         log_frame = tk.Frame(parent, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
         # expand=True so the log soaks up the spare height the scroll area
         # hands down on a tall window; height=4 keeps its *minimum* small so a
@@ -560,31 +691,30 @@ class AppWindow:
             font=(FONT, 9), relief="flat", bd=0, highlightthickness=0, cursor="hand2",
         ).pack(side="left")
         self._button(bottom, "Quit", self._on_quit, danger=True, side="right")
-        self.hint_var = tk.StringVar(value="F10 toggle   ·   F9 scan at cursor   ·   Ctrl+F10 quit")
+        # Filled in by _apply_mode_controls from the current hotkey labels.
+        self.hint_var = tk.StringVar(value="")
         tk.Label(
             bottom, textvariable=self.hint_var, bg=BG, fg=TEXT_DIM, font=(FONT, 8)
         ).pack(side="right", padx=10)
 
     # --- tab interaction ---------------------------------------------------
-    def _on_tab_clicked(self, mode: str) -> None:
-        if mode == self.selection_mode_var.get():
-            return
-        self.selection_mode_var.set(mode)
-        self._on_selection_mode_selected()
+    def _on_tab_clicked(self, key: str) -> None:
+        # A mode tab both selects the scan mode and shows its panel; the
+        # Settings tab only swaps the panel, leaving the scan mode alone.
+        if key in self._MODE_TABS and key != self.selection_mode_var.get():
+            self.selection_mode_var.set(key)
+            self._apply_mode_controls(key)
+            self._on_selection_mode_change(key)
+        self._apply_active_tab(key)
 
-    def _on_tab_hover(self, mode: str, entering: bool) -> None:
-        if mode == self.selection_mode_var.get():
-            return  # the selected tab already has its own colours
-        tab, _underline = self._tabs[mode]
+    def _on_tab_hover(self, key: str, entering: bool) -> None:
+        if key == self._active_tab:
+            return  # the active tab already has its own colours
+        tab, _underline = self._tabs[key]
         tab.config(fg=TEXT if entering else TEXT_DIM)
 
     def _apply_topmost(self) -> None:
         self.root.attributes("-topmost", self.topmost_var.get())
-
-    def _on_selection_mode_selected(self) -> None:
-        mode = self.selection_mode_var.get()
-        self._apply_mode_ui(mode)
-        self._on_selection_mode_change(mode)
 
     def set_selection_mode_selection(self, mode: str) -> None:
         """Reflects the persisted selection mode at startup without firing
@@ -593,33 +723,52 @@ class AppWindow:
 
         def _set() -> None:
             self.selection_mode_var.set(mode)
-            self._apply_mode_ui(mode)
+            self._apply_mode_controls(mode)
+            self._apply_active_tab(mode)
 
         self.call_soon(_set)
 
-    def _apply_mode_ui(self, mode: str) -> None:
-        # Show only the active mode's panel, and mark its tab.
-        for m, (tab, underline) in self._tabs.items():
-            selected = m == mode
-            tab.config(fg=ACCENT if selected else TEXT_DIM, font=(FONT, 10, "bold" if selected else "normal"))
+    def _apply_active_tab(self, tab: str) -> None:
+        """Highlight `tab`, show only its panel, and hide the scan action bar
+        on the Settings tab (those buttons are scan controls, not config)."""
+        self._active_tab = tab
+        for k, (label, underline) in self._tabs.items():
+            selected = k == tab
+            label.config(fg=ACCENT if selected else TEXT_DIM, font=(FONT, 10, "bold" if selected else "normal"))
             underline.config(bg=ACCENT if selected else BORDER)
-        for m, panel in self._panels.items():
-            if m == mode:
+        for k, panel in self._panels.items():
+            if k == tab:
                 panel.pack(fill="x")
             else:
                 panel.pack_forget()
 
-        # F9 ("Scan Now") is meaningful in Single (scan at cursor) and Grid
-        # (scan the whole grid), but not in Multi (there you drag instead).
+        if tab == "settings":
+            self._actions_frame.pack_forget()
+        elif not self._actions_frame.winfo_ismapped():
+            self._actions_frame.pack(fill="x", padx=16, pady=(12, 0), before=self._activity_anchor)
+
+        # The inner frame's height is pinned to the viewport (so the log can
+        # fill a tall window), which suppresses the <Configure> that would
+        # otherwise re-run the reflow after this content swap - so trigger it
+        # explicitly, or a taller panel would clip with no scrollbar.
+        self._schedule_reflow()
+
+    def _apply_mode_controls(self, mode: str) -> None:
+        """Scan-now enablement and the footer hint follow the active SCAN MODE
+        (not the visible tab), so they stay correct while the Settings tab is
+        open."""
         if mode == "multi":
             self._set_button_enabled(self.scan_now_btn, False)
-            self.hint_var.set("F10 toggle   ·   drag to select & scan   ·   Ctrl+F10 quit")
+            action = "drag to select & scan"
         elif mode == "grid":
             self._set_button_enabled(self.scan_now_btn, True)
-            self.hint_var.set("F10 toggle   ·   F9 scan grid   ·   Ctrl+F10 quit")
+            action = f"{self._hk_labels['scan']} scan grid"
         else:  # single
             self._set_button_enabled(self.scan_now_btn, True)
-            self.hint_var.set("F10 toggle   ·   F9 scan at cursor   ·   Ctrl+F10 quit")
+            action = f"{self._hk_labels['scan']} scan at cursor"
+        self.hint_var.set(
+            f"{self._hk_labels['toggle']} toggle   ·   {action}   ·   {self._hk_labels['quit']} quit"
+        )
 
     def _on_price_workers_scale(self, raw: str) -> None:
         # ttk.Scale is continuous; snap to an int and only fire the persist
@@ -719,17 +868,6 @@ class AppWindow:
     def call_soon(self, func: Callable[[], None]) -> None:
         self.root.after(0, func)
 
-    def set_status(self, text: str) -> None:
-        # The dot colour tracks scan state: accent when a scan mode is live,
-        # dim otherwise. "Idle" is the only resting state main.py sets.
-        active = text != "Idle"
-
-        def _set() -> None:
-            self.status_var.set(text)
-            self.status_dot.config(fg=ACCENT if active else TEXT_DIM)
-
-        self.call_soon(_set)
-
     def set_box_size_label(self, text: str) -> None:
         # main.py passes "Box size: WxHpx"; the panel already labels the field
         # "Box size:", so strip a redundant leading label if present.
@@ -739,11 +877,34 @@ class AppWindow:
     def set_grid_info_label(self, text: str) -> None:
         self.call_soon(lambda: self.grid_info_var.set(text))
 
-    def set_toggle_label(self, text: str) -> None:
-        # The primary button keeps its accent bg through label changes.
+    def set_scan_active(self, active: bool) -> None:
+        """Reflect scan-mode on/off across the status pill and the primary
+        button's label (Start/Stop + the current toggle hotkey). Thread-safe.
+        """
+
         def _set() -> None:
-            self.toggle_btn.config(text=text)
-            self.toggle_btn._rest_bg = ACCENT
+            self._scan_active = active
+            self.status_var.set("Scan mode ON" if active else "Idle")
+            self.status_dot.config(fg=ACCENT if active else TEXT_DIM)
+            self.toggle_btn.config(text=self._toggle_btn_text())
+
+        self.call_soon(_set)
+
+    def set_hotkey_labels(self, labels: dict) -> None:
+        """Update the shown hotkey bindings (a dict of any of scan/toggle/quit
+        -> pretty label) after a rebind, and refresh everything derived from
+        them: the settings rows, the two action buttons, the footer hint.
+        Thread-safe.
+        """
+
+        def _set() -> None:
+            self._hk_labels.update(labels)
+            for action, pretty in labels.items():
+                if action in self._hk_vars:
+                    self._hk_vars[action].set(pretty)
+            self.toggle_btn.config(text=self._toggle_btn_text())
+            self.scan_now_btn.config(text=self._scan_btn_text())
+            self._apply_mode_controls(self.selection_mode_var.get())
 
         self.call_soon(_set)
 
@@ -756,7 +917,26 @@ class AppWindow:
         self.call_soon(_show)
 
     def show_lookup_result(self, x: int, y: int, lines: list[str]) -> None:
-        self.call_soon(lambda: ResultPopup(self.root, x, y, lines))
+        def _show() -> None:
+            self._destroy_result_popup()  # replace, never stack
+            self._result_popup = ResultPopup(self.root, x, y, lines)
+
+        self.call_soon(_show)
+
+    def clear_lookup_result(self) -> None:
+        """Remove any single-scan result popup immediately. Called at the
+        start of a new scan so the previous item's name vanishes at once
+        (and never lingers into the next scan's screen grab). Thread-safe.
+        """
+        self.call_soon(self._destroy_result_popup)
+
+    def _destroy_result_popup(self) -> None:
+        if self._result_popup is not None:
+            try:
+                self._result_popup.destroy()
+            except tk.TclError:
+                pass  # already self-dismissed (timeout / click)
+            self._result_popup = None
 
     def start_box_calibration(
         self,
@@ -1367,6 +1547,116 @@ class ResultPopup(tk.Toplevel):
         self.after(duration_ms, self._safe_destroy)
 
     def _safe_destroy(self) -> None:
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
+class HotkeyCaptureDialog(tk.Toplevel):
+    """Modal: records the next key or modifier+key combo the user presses and
+    hands it back in pynput GlobalHotKeys syntax via on_result(hotkey) - or
+    on_result(None) if cancelled (Esc / window closed).
+
+    Capture uses a short-lived pynput keyboard listener rather than Tk key
+    events, so it records keys exactly the way the global hotkeys are matched
+    (real function keys and modifiers) instead of wrestling with Tk's
+    platform-specific modifier bitmasks. The listener runs on pynput's own
+    thread, so every UI touch is marshalled back with self.after(0, ...) - the
+    same cross-thread pattern the mouse calibrators use.
+    """
+
+    def __init__(self, parent: tk.Misc, title: str, on_result: Callable[[str | None], None]) -> None:
+        super().__init__(parent)
+        self._on_result = on_result
+        self._done = False
+        self._held: list[str] = []  # modifier tokens currently down
+
+        self.title(title)
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+
+        frame = tk.Frame(self, bg=BG)
+        frame.pack(fill="both", expand=True, padx=24, pady=20)
+        tk.Label(frame, text=title, bg=BG, fg=TEXT, font=(FONT, 11, "bold")).pack()
+        self._prompt = tk.Label(
+            frame, text="Press a key or combo…", bg=BG, fg=ACCENT, font=(FONT, 14, "bold")
+        )
+        self._prompt.pack(pady=(12, 8))
+        tk.Label(
+            frame, text="Esc to cancel", bg=BG, fg=TEXT_DIM, font=(FONT, 8)
+        ).pack()
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        # Esc via Tk too, as a backstop in case the pynput listener misses it.
+        self.bind("<Escape>", lambda _e: self._cancel())
+
+        self.update_idletasks()
+        self._center_on(parent)
+        self.grab_set()
+
+        self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
+        self._listener.start()
+
+    def _center_on(self, parent: tk.Misc) -> None:
+        w, h = self.winfo_width(), self.winfo_height()
+        px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+        py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+        self.geometry(f"+{max(0, px)}+{max(0, py)}")
+
+    # --- pynput callbacks (other thread) - marshal every UI touch ---------
+    def _on_press(self, key) -> None:
+        token = _hk_key_token(key)
+        if token is None:
+            return
+        if key in _HK_MOD_MAP:
+            if token not in self._held:
+                self._held.append(token)
+                self.after(0, self._render_held)
+            return
+        # A non-modifier key ends the capture: combo = held modifiers + key,
+        # modifiers in a stable canonical order.
+        mods = [m for m in _HK_MOD_TOKEN_ORDER if m in self._held]
+        self.after(0, lambda: self._finish("+".join(mods + [token])))
+
+    def _on_release(self, key) -> None:
+        token = _hk_key_token(key)
+        if token in self._held:
+            self._held.remove(token)
+            self.after(0, self._render_held)
+
+    def _render_held(self) -> None:
+        if self._done:
+            return
+        if self._held:
+            self._prompt.config(text=" + ".join(hotkey_label(m) for m in self._held) + " + …")
+        else:
+            self._prompt.config(text="Press a key or combo…")
+
+    def _finish(self, hotkey: str) -> None:
+        if self._done:
+            return
+        self._done = True
+        self._teardown()
+        self._on_result(hotkey)
+
+    def _cancel(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        self._teardown()
+        self._on_result(None)
+
+    def _teardown(self) -> None:
+        try:
+            self._listener.stop()
+        except Exception:
+            pass
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
         try:
             self.destroy()
         except tk.TclError:

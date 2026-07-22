@@ -177,16 +177,35 @@ class HotkeyListener:
         on_toggle_scan: Callable[[], None],
         on_quit: Callable[[], None],
     ) -> None:
+        self._on_scan = on_scan
+        self._on_toggle_scan = on_toggle_scan
+        self._on_quit = on_quit
+        self._listener: keyboard.GlobalHotKeys | None = None
+        self._build()
+
+    def _build(self) -> None:
+        # Reads the current config.HOTKEY_* values, so rebinding is just
+        # save-then-restart. A pynput listener is single-use (a stopped one
+        # can't be restarted), so restart() always constructs a fresh one.
         self._listener = keyboard.GlobalHotKeys(
             {
-                config.HOTKEY_SCAN: on_scan,
-                config.HOTKEY_TOGGLE_SCAN: on_toggle_scan,
-                config.HOTKEY_QUIT: on_quit,
+                config.HOTKEY_SCAN: self._on_scan,
+                config.HOTKEY_TOGGLE_SCAN: self._on_toggle_scan,
+                config.HOTKEY_QUIT: self._on_quit,
             }
         )
 
     def start(self) -> None:
-        self._listener.start()
+        if self._listener is not None:
+            self._listener.start()
 
     def stop(self) -> None:
-        self._listener.stop()
+        if self._listener is not None:
+            self._listener.stop()
+            self._listener = None
+
+    def restart(self) -> None:
+        """Rebind to the current config.HOTKEY_* values."""
+        self.stop()
+        self._build()
+        self.start()

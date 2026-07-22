@@ -25,6 +25,7 @@ PRICE_CACHE_FILE = CACHE_DIR / "prices.json"
 BOX_CALIBRATION_FILE = CACHE_DIR / "box_calibration.json"
 GRID_CALIBRATION_FILE = CACHE_DIR / "grid_calibration.json"
 OCR_ENGINE_FILE = CACHE_DIR / "ocr_engine.json"
+HOTKEYS_FILE = CACHE_DIR / "hotkeys.json"
 ANTHROPIC_API_KEY_FILE = CACHE_DIR / "anthropic_api_key.json"
 GOOGLE_API_KEY_FILE = CACHE_DIR / "google_api_key.json"
 LOG_FILE = LOGS_DIR / "app.log"
@@ -32,10 +33,37 @@ SCAN_LOG_FILE = LOGS_DIR / "scans.txt"
 
 # --- Hotkeys (pynput <...> syntax) --------------------------------------
 # Chosen because Warframe doesn't use F9/F10 for anything by default.
-# Change these if they clash with something on your system.
+# These are the DEFAULTS; the user can rebind them in the Settings tab, which
+# persists overrides to hotkeys.json (loaded below). Stored in pynput's
+# GlobalHotKeys syntax so they can be handed straight to the listener.
 HOTKEY_SCAN = "<f9>"           # scan a box centered on the cursor (only while scan mode is on)
 HOTKEY_TOGGLE_SCAN = "<f10>"   # turn scan mode on / off
 HOTKEY_QUIT = "<ctrl>+<f10>"   # quit the app entirely
+
+
+def load_hotkeys() -> None:
+    """Loads any rebindings from hotkeys.json over the defaults above."""
+    global HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT
+    if not HOTKEYS_FILE.exists():
+        return
+    try:
+        data = json.loads(HOTKEYS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    HOTKEY_SCAN = data.get("scan") or HOTKEY_SCAN
+    HOTKEY_TOGGLE_SCAN = data.get("toggle") or HOTKEY_TOGGLE_SCAN
+    HOTKEY_QUIT = data.get("quit") or HOTKEY_QUIT
+
+
+def save_hotkeys(scan: str, toggle: str, quit_: str) -> None:
+    global HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT
+    HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT = scan, toggle, quit_
+    HOTKEYS_FILE.write_text(
+        json.dumps({"scan": scan, "toggle": toggle, "quit": quit_}), encoding="utf-8"
+    )
+
+
+load_hotkeys()
 
 # --- Item box size (set once via the "Set Item Box Size..." button) --------
 # The pixel size of the box grabbed around the cursor on each scan, centered

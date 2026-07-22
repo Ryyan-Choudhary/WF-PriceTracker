@@ -75,6 +75,11 @@ class App:
         self.selection_mode = config.SELECTION_MODE
         self.cursor_tracker: scan.CursorTracker | None = None
         self.drag_select_watcher: scan.DragSelectWatcher | None = None
+        self.hotkeys: scan.HotkeyListener | None = None
+        # While the user is capturing a new hotkey, the global listener is
+        # still live; this flag makes its callbacks no-op so the very keys
+        # being bound don't also fire the action they're being bound to.
+        self._capturing_hotkey = False
         self._catalog_refresh_lock = threading.Lock()
 
     def load_items(self) -> None:
@@ -111,6 +116,8 @@ class App:
 
     # --- hotkey / button callbacks --------------------------------------
     def on_toggle_scan(self) -> None:
+        if self._capturing_hotkey:
+            return
         self.scan_active = not self.scan_active
         self._refresh_icon()
         if self.scan_active:
@@ -119,28 +126,27 @@ class App:
             self._stop_mode_listener()
         if not self.window:
             return
+        self.window.set_scan_active(self.scan_active)
         if self.scan_active:
-            self.window.set_status("Scan mode ON")
-            self.window.set_toggle_label("Stop Scan Mode (F10)")
             if self.selection_mode == "multi":
                 self.window.log("--- Scan mode ON: drag a box around any items to scan them ---")
             elif self.selection_mode == "grid":
-                self.window.log("--- Scan mode ON: open your inventory, press F9 to scan the grid ---")
+                self.window.log("--- Scan mode ON: open your inventory, press the scan hotkey ---")
             else:
-                self.window.log("--- Scan mode ON: hover an item, press F9 ---")
+                self.window.log("--- Scan mode ON: hover an item, press the scan hotkey ---")
         else:
-            self.window.set_status("Idle")
-            self.window.set_toggle_label("Start Scan Mode (F10)")
             self.window.log("--- Scan mode OFF ---")
 
     def on_scan(self) -> None:
+        if self._capturing_hotkey:
+            return
         if self.selection_mode == "multi":
             if self.window:
-                self.window.log("F9 is for Single Item / Grid mode - Multi-Select scans on click-drag instead.")
+                self.window.log("The scan hotkey is for Single / Grid mode - Multi-Select scans on click-drag instead.")
             return
         if not self.scan_active:
             if self.window:
-                self.window.log("Not scanning - press F10 (or Start Scan Mode) first.")
+                self.window.log("Not scanning - turn on Scan Mode first.")
             return
         if self.selection_mode == "grid":
             if config.GRID is None:
@@ -219,6 +225,59 @@ class App:
         if self.window:
             self.window.log(f"Price fetch concurrency set to {config.PRICE_FETCH_WORKERS} thread(s).")
 
+    # --- hotkeys ---------------------------------------------------------
+    _HK_ACTION_LABELS = {"toggle": "Toggle scan mode", "scan": "Scan now", "quit": "Quit"}
+
+    def begin_hotkey_capture(self) -> None:
+        # Suppress the global listener's actions until set_hotkey clears this,
+        # so the combo being captured doesn't also trigger a scan/quit.
+        self._capturing_hotkey = True
+
+    def set_hotkey(self, action: str, hotkey: str | None) -> None:
+        """Apply a rebind captured in the UI. `hotkey` is in pynput syntax, or
+        None if the capture was cancelled. Validates, rejects collisions,
+        persists, and restarts the global listener."""
+        self._capturing_hotkey = False
+        if not hotkey:
+            return  # cancelled - nothing to change
+
+        from pynput import keyboard
+
+        try:
+            keyboard.HotKey.parse(hotkey)
+        except Exception:
+            if self.window:
+                self.window.log("Couldn't read that key combo - keeping the current binding.")
+            return
+
+        current = {
+            "scan": config.HOTKEY_SCAN,
+            "toggle": config.HOTKEY_TOGGLE_SCAN,
+            "quit": config.HOTKEY_QUIT,
+        }
+        for other, existing in current.items():
+            if other != action and existing == hotkey:
+                if self.window:
+                    self.window.log(
+                        f"{gui.hotkey_label(hotkey)} is already bound to "
+                        f"{self._HK_ACTION_LABELS[other]} - pick another key."
+                    )
+                return
+
+        current[action] = hotkey
+        config.save_hotkeys(scan=current["scan"], toggle=current["toggle"], quit_=current["quit"])
+        if self.hotkeys is not None:
+            try:
+                self.hotkeys.restart()
+            except Exception:
+                log.exception("Failed to apply the new hotkey binding")
+                if self.window:
+                    self.window.log("Failed to apply the new hotkey - check data/logs/app.log.")
+                return
+        if self.window:
+            self.window.set_hotkey_labels({k: gui.hotkey_label(v) for k, v in current.items()})
+            self.window.log(f"{self._HK_ACTION_LABELS[action]} rebound to {gui.hotkey_label(hotkey)}.")
+
     def set_box_size(self) -> None:
         if self.window is None:
             return
@@ -229,6 +288,8 @@ class App:
         )
 
     def on_quit(self) -> None:
+        if self._capturing_hotkey:
+            return
         self._stop_mode_listener()
         if self.window:
             self.window.log("Quitting...")
@@ -295,6 +356,20 @@ class App:
         if self.window:
             self.window.update_cursor_box_position(x, y)
 
+    def _reshow_cursor_box(self) -> None:
+        """Re-draw the cursor target box after a scan's capture withdrew it.
+        No-ops unless single-scan mode is live and the box is calibrated."""
+        if (
+            self.window is None
+            or not self.scan_active
+            or self.selection_mode != "single"
+            or config.BOX_WIDTH_PX is None
+            or config.BOX_HEIGHT_PX is None
+        ):
+            return
+        cx, cy = scan.get_cursor_position()
+        self.window.show_cursor_box(config.BOX_WIDTH_PX, config.BOX_HEIGHT_PX, cx, cy)
+
     def _start_drag_select(self) -> None:
         if self.drag_select_watcher is None:
             self.drag_select_watcher = scan.DragSelectWatcher(
@@ -334,11 +409,21 @@ class App:
         return self.window.capture_hidden(capture_fn)
 
     def _scan_worker(self, cx: int, cy: int) -> None:
+        # Clear the previous scan's result popup up front, so the old name
+        # vanishes the instant you scan again (and can't be re-captured into
+        # this grab if it happened to overlap the box).
+        if self.window:
+            self.window.clear_lookup_result()
         try:
             crop = self._capture(lambda: scan.grab_box_at(cx, cy, config.BOX_WIDTH_PX, config.BOX_HEIGHT_PX))
         except Exception:
             log.exception("Scan screen capture failed")
             return
+        finally:
+            # capture_hidden withdraws the cursor box for the grab and never
+            # restores it (its owner does); bring it back so the target
+            # outline keeps following the mouse after every scan.
+            self._reshow_cursor_box()
 
         if self.items_index is None:
             if self.window:
@@ -518,11 +603,22 @@ class App:
             log.warning("Could not write to scan log file", exc_info=True)
 
     def build_tray(self) -> pystray.Icon:
+        # Labels are callables so they re-read the (rebindable) hotkeys each
+        # time the menu opens, instead of freezing the defaults at startup.
         menu = pystray.Menu(
             pystray.MenuItem("Show window", lambda: self.show_window(), default=True),
-            pystray.MenuItem("Toggle scan mode (F10)", lambda: self.on_toggle_scan()),
-            pystray.MenuItem("Scan now (F9)", lambda: self.on_scan()),
-            pystray.MenuItem("Quit (Ctrl+F10)", lambda: self.on_quit()),
+            pystray.MenuItem(
+                lambda _i: f"Toggle scan mode ({gui.hotkey_label(config.HOTKEY_TOGGLE_SCAN)})",
+                lambda: self.on_toggle_scan(),
+            ),
+            pystray.MenuItem(
+                lambda _i: f"Scan now ({gui.hotkey_label(config.HOTKEY_SCAN)})",
+                lambda: self.on_scan(),
+            ),
+            pystray.MenuItem(
+                lambda _i: f"Quit ({gui.hotkey_label(config.HOTKEY_QUIT)})",
+                lambda: self.on_quit(),
+            ),
         )
         self.icon = pystray.Icon("wf_pricer", tray_mod.make_icon_image(False), "WF-PriceTracker", menu)
         return self.icon
@@ -546,6 +642,8 @@ def main() -> None:
         on_selection_mode_change=app.set_selection_mode,
         on_calibrate_grid=app.calibrate_grid,
         on_price_workers_change=app.set_price_workers,
+        on_set_hotkey=app.set_hotkey,
+        on_hotkey_capture_start=app.begin_hotkey_capture,
         on_quit=app.on_quit,
     )
     app.window = window
@@ -567,6 +665,7 @@ def main() -> None:
         window.log("(First EasyOCR run will download its model weights - needs internet, one-time.)")
 
     hotkeys = scan.HotkeyListener(on_scan=app.on_scan, on_toggle_scan=app.on_toggle_scan, on_quit=app.on_quit)
+    app.hotkeys = hotkeys  # so rebinds can restart it
     hotkeys.start()
 
     icon = app.build_tray()
