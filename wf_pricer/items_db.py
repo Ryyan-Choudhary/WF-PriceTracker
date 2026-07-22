@@ -20,6 +20,27 @@ log = logging.getLogger(__name__)
 _NON_NAME_CHARS = re.compile(r"[^A-Za-z0-9& ]+")
 _WHITESPACE = re.compile(r"\s+")
 
+# Text the app's own overlay and Warframe's chrome put on screen, which OCR
+# picks up just like an item label. Matched against the NORMALIZED query (so
+# "Stop Scan Mode (F10)" has already become "stop scan mode f10"), and
+# anchored, because these have to be the whole line to count: an unanchored
+# pattern takes real items down with it. "No Return" and "No Current Leap"
+# are real mods, and "F1".."F5" appear in fourteen real relic names
+# ("Meso F2 Relic"), so a bare `f\d` or a substring "no return" would blacklist
+# items you actually scan.
+_UI_ARTIFACT_RE = re.compile(
+    r"^(?:"
+    r"(?:start|stop) scan mode(?: f\d+)?"
+    r"|no items? recognized"
+    r"|scanning region"
+    r"|inventory"
+    r"|f\d+"          # a lone hotkey label, not the "F2" inside "Meso F2 Relic"
+    r"|c\d+"
+    r"|\d+"
+    r")$",
+    re.IGNORECASE,
+)
+
 
 def normalize_name(text: str) -> str:
     """Lowercase and reduce to letters/digits/&/spaces, turning every other
@@ -32,6 +53,21 @@ def normalize_name(text: str) -> str:
     fuzzy-match "Prime" and "Chassis" properly.
     """
     return _WHITESPACE.sub(" ", _NON_NAME_CHARS.sub(" ", text)).strip().lower()
+
+
+def _reject_query(text: str) -> bool:
+    """True if text is this app's own overlay chrome or pure OCR noise
+    ("====", "[[18]]") rather than anything worth matching.
+
+    Normalizes first, which is what lets the patterns stay anchored: it strips
+    the punctuation these arrive with ("Stop Scan Mode (F10)") and collapses
+    separator noise to nothing at all. Safe to pass an already-normalized
+    query - normalize_name is idempotent.
+    """
+    normalized = normalize_name(text)
+    if not normalized:
+        return True
+    return _UI_ARTIFACT_RE.match(normalized) is not None
 
 
 @dataclass(frozen=True)
@@ -88,17 +124,22 @@ class ItemsIndex:
            strength of shared generic words.
         2. RANK: score the whole text against only that family's items.
 
+        When the top candidates are too close to call on the whole string,
+        stage 3 is a WORD RUNOFF (see _break_tie_by_word): compare them one
+        word at a time - first word, then second, then third - and take the
+        one that wins a position outright.
+
         Returns None if nothing clears the confidence cutoff (which is what
         keeps UI chrome like "INVENTORY" from being reported as an item), or
-        if the top two candidates are too close to call - e.g. text missing
-        an item's part-specific last word ("Titania Prime") ties against
-        every part of that frame, and guessing means silently reporting the
-        wrong item.
+        if even the runoff can't separate the leaders - e.g. text missing an
+        item's part-specific last word ("Titania Prime") draws against every
+        part of that frame at every word it has, and guessing means silently
+        reporting the wrong item.
         """
         if len(text.strip()) < config.OCR_MIN_TEXT_LEN:
             return None
         query = normalize_name(text)
-        if not query:
+        if not query or _reject_query(query):
             return None
 
         candidates = self._anchor_candidates(query)
@@ -119,19 +160,85 @@ class ItemsIndex:
             names,
             scorer=fuzz.WRatio,
             score_cutoff=config.FUZZY_MATCH_SCORE_CUTOFF,
-            limit=2,
+            limit=config.FUZZY_MATCH_CANDIDATES,
         )
         if not results:
             return None
-        if len(results) > 1 and results[0][1] - results[1][1] < config.FUZZY_MATCH_MIN_MARGIN:
+        if len(results) == 1 or results[0][1] - results[1][1] >= config.FUZZY_MATCH_MIN_MARGIN:
+            return self._items[candidates[results[0][2]]]
+
+        # Too close to call on the whole string. Before refusing, try to
+        # separate the tied group a word at a time (see _break_tie_by_word).
+        tied = [candidates[r[2]] for r in results
+                if results[0][1] - r[1] < config.FUZZY_MATCH_MIN_MARGIN]
+        runoff = self._break_tie_by_word(query, tied)
+        if runoff is not None:
+            winner, pos = runoff
             log.info(
-                "Ambiguous match for %r: %r (%.1f) vs %r (%.1f) - refusing to guess",
-                text,
-                self._names[candidates[results[0][2]]], results[0][1],
-                self._names[candidates[results[1][2]]], results[1][1],
+                "Tie for %r between %s broken on %s -> %r",
+                text, [self._names[i] for i in tied],
+                f"word {pos + 1}" if pos >= 0 else "coverage of the text",
+                self._names[winner],
             )
+            return self._items[winner]
+
+        log.info(
+            "Ambiguous match for %r: %s - refusing to guess",
+            text, [self._names[i] for i in tied],
+        )
+        return None
+
+    def _break_tie_by_word(self, query: str, tied: list[int]) -> Optional[tuple[int, int]]:
+        """Separate candidates the whole-string score couldn't, by comparing
+        them against the query ONE WORD AT A TIME.
+
+        Position 0 (the base name) is compared first; if that draws, position
+        1, then 2 - configurable via FUZZY_TIEBREAK_MAX_WORDS. A position
+        decides the runoff only if exactly one candidate leads it by
+        FUZZY_TIEBREAK_MIN_MARGIN; otherwise the trailing candidates are
+        dropped and the survivors go on to the next word. This is what picks
+        "Volt Prime Systems Blueprint" over its Neuroptics sibling when OCR
+        garbles enough of the string that the two score identically overall.
+
+        Returns (item_index, deciding_word_position), the position being -1
+        when the coverage guard below left only one candidate standing before
+        any word was compared. Returns None - i.e. keeps the old
+        refuse-to-guess behavior - when the query runs out of words with more
+        than one candidate still standing (a genuinely incomplete read like
+        "Titania Prime"), or when no candidate accounts for enough of the
+        query (OCR having smeared two neighbouring tiles into one line).
+        """
+        q_words = query.split()
+        if not q_words:
             return None
-        return self._items[candidates[results[0][2]]]
+
+        # A runoff only makes sense between candidates that explain the text.
+        # Two tiles merged into one line leave far more query words than any
+        # single item has, and the leading item would otherwise win on word 0.
+        alive = [
+            i for i in tied
+            if len(q_words) - len(self._norm_names[i].split()) <= config.FUZZY_TIEBREAK_MAX_EXTRA_WORDS
+        ]
+        if len(alive) < 2:
+            return (alive[0], -1) if len(alive) == 1 else None
+
+        for pos in range(min(len(q_words), config.FUZZY_TIEBREAK_MAX_WORDS)):
+            q_word = q_words[pos]
+            scores = []
+            for i in alive:
+                words = self._norm_names[i].split()
+                # A candidate with no word at this position has nothing to
+                # offer the comparison and scores zero rather than being
+                # skipped, so a shorter name can lose the runoff outright.
+                scores.append(fuzz.ratio(q_word, words[pos]) if pos < len(words) else 0.0)
+
+            best = max(scores)
+            leaders = [i for i, s in zip(alive, scores) if best - s < config.FUZZY_TIEBREAK_MIN_MARGIN]
+            if len(leaders) == 1:
+                return leaders[0], pos
+            alive = leaders  # still drawn here; the trailing ones are out
+
+        return None
 
     def _exact_candidate(self, query: str, candidates: list[int]) -> Optional[int]:
         """Index of the one candidate matching `query` exactly, or by an
@@ -149,16 +256,27 @@ class ItemsIndex:
         Falls back to every item when nothing anchors, so an unusual read can
         still match on overall similarity alone.
         """
-        tokens = [t for t in query.split() if len(t) >= config.FUZZY_ANCHOR_MIN_TOKEN_LEN]
+        words = query.split()
+        tokens = [t for t in words if len(t) >= config.FUZZY_ANCHOR_MIN_TOKEN_LEN]
+        # The base name IS the first word, so probe it even when it's below the
+        # speck threshold. Five real families have a 1-2 letter base ("Bo Prime
+        # Handle", "No Return", "Da-Ren", the Hollvania scenes) and were
+        # unreachable without this - the threshold exists to ignore specks
+        # found MID-name, not to discard the one word we index families by.
+        if words and words[0] not in tokens:
+            tokens.insert(0, words[0])
         if not tokens:
-            return list(range(len(self._items)))
+            # Nothing but specks - no real item name survives OCR as only
+            # 1-2 character tokens, and scoring the catalog against noise is
+            # exactly how a false positive gets in.
+            return []
 
         families: set[str] = set()
         for token in tokens:
             for base, _score, _i in process.extract(
                 token,
                 self._bases,
-                scorer=fuzz.ratio,
+                scorer=fuzz.partial_ratio,
                 score_cutoff=config.FUZZY_ANCHOR_SCORE_CUTOFF,
                 limit=config.FUZZY_ANCHOR_MAX_FAMILIES,
             ):

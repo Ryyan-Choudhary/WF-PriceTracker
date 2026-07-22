@@ -186,19 +186,25 @@ def _extract_lines_claude_vision(image: Image.Image, sparse: bool = False) -> li
     image.convert("RGB").save(buf, format="PNG")
     b64 = base64.standard_b64encode(buf.getvalue()).decode("ascii")
 
-    response = client.messages.create(
-        model=config.CLAUDE_VISION_MODEL,
-        max_tokens=64,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-                    {"type": "text", "text": _VISION_PROMPT},
-                ],
-            }
-        ],
-    )
+    try:
+        response = client.messages.create(
+            model=config.CLAUDE_VISION_MODEL,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+                        {"type": "text", "text": _VISION_PROMPT},
+                    ],
+                }
+            ],
+        )
+    except Exception as exc:
+        # A rate limit or dropped connection on one band shouldn't abort the
+        # whole scan - report no text and let the other bands through.
+        log.warning("Claude Vision failed (%s), treating as no text", exc)
+        return []
     text = "".join(block.text for block in response.content if block.type == "text")
     return _parse_vision_text(text, image)
 
@@ -219,12 +225,14 @@ def _get_gemini_client():
 
 def _extract_lines_gemini_vision(image: Image.Image, sparse: bool = False) -> list[OcrLine]:
     client = _get_gemini_client()
-    # The SDK accepts a PIL Image directly in `contents` - no manual
-    # base64/Part encoding needed, unlike the Anthropic SDK.
-    response = client.models.generate_content(
-        model=config.GEMINI_VISION_MODEL,
-        contents=[image.convert("RGB"), _VISION_PROMPT],
-    )
+    try:
+        response = client.models.generate_content(
+            model=config.GEMINI_VISION_MODEL,
+            contents=[image.convert("RGB"), _VISION_PROMPT],
+        )
+    except Exception as exc:
+        log.warning("Gemini Vision failed (%s), treating as no text", exc)
+        return []
     return _parse_vision_text(response.text or "", image)
 
 

@@ -9,6 +9,7 @@ The shared cache is guarded by a lock so concurrent workers can't corrupt it.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import threading
@@ -59,6 +60,49 @@ def _save_disk_cache() -> None:
         config.PRICE_CACHE_FILE.write_text(json.dumps(_cache), encoding="utf-8")
     except OSError:
         log.warning("Could not write price cache to disk", exc_info=True)
+
+
+# Rewriting the whole cache file after every single price would mean one full
+# JSON dump per item in a grid scan, so writes are debounced: the timer is
+# pushed back on each new price and only fires once the burst goes quiet.
+_cache_dirty = False
+_cache_write_timer: Optional[threading.Timer] = None
+
+
+def _schedule_disk_save() -> None:
+    """Debounce a disk write. Caller must hold _cache_lock - the timer handle
+    is shared with the worker threads that are also scheduling saves."""
+    global _cache_dirty, _cache_write_timer
+    _cache_dirty = True
+    if _cache_write_timer is not None:
+        _cache_write_timer.cancel()
+    _cache_write_timer = threading.Timer(config.PRICE_CACHE_WRITE_DELAY_S, _flush_disk_save)
+    _cache_write_timer.daemon = True
+    _cache_write_timer.start()
+
+
+def _flush_disk_save() -> None:
+    global _cache_dirty, _cache_write_timer
+    with _cache_lock:
+        if not _cache_dirty:
+            return
+        _save_disk_cache()
+        _cache_dirty = False
+        _cache_write_timer = None
+
+
+def _flush_on_shutdown() -> None:
+    """The debounce timer is a daemon thread, so a pending write would be lost
+    if the app exits during the quiet period right after a scan."""
+    global _cache_write_timer
+    with _cache_lock:
+        if _cache_write_timer is not None:
+            _cache_write_timer.cancel()
+            _cache_write_timer = None
+    _flush_disk_save()
+
+
+atexit.register(_flush_on_shutdown)
 
 
 def _fetch_orders(slug: str) -> list[dict]:
@@ -132,7 +176,7 @@ def get_price(slug: str) -> PriceEstimate:
     estimate = _estimate_from_orders(orders)
     with _cache_lock:
         _cache[slug] = {"ts": now, "estimate": estimate.__dict__}
-        _save_disk_cache()
+        _schedule_disk_save()
     return estimate
 
 

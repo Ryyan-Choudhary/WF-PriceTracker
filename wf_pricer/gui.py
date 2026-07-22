@@ -23,12 +23,39 @@ from .scan import virtual_screen_rect
 log = logging.getLogger(__name__)
 
 
+# --- Palette ---------------------------------------------------------------
+# One dark, low-contrast set of surfaces with a single bright accent, shared by
+# the window AND the on-screen overlays so the labels drawn over the game read
+# as part of the same app. Tk can't do rounded corners, shadows or gradients,
+# so "soft" here comes from close-valued surfaces, hairline borders and
+# generous padding rather than from bevels - nothing uses a 3D relief.
+BG = "#12141a"          # window background
+SURFACE = "#181b23"     # cards, log, panels
+SURFACE_HI = "#20242e"  # inputs, hover states
+BORDER = "#2a2f3a"      # hairline separators
+TEXT = "#e6e9ef"
+TEXT_DIM = "#8b93a7"    # secondary copy, hints
+ACCENT = "#4ddbea"      # the one bright highlight (also the overlay outline)
+ACCENT_DIM = "#2b7f8c"  # accent at rest / pressed
+DANGER = "#ff5f6d"
+OK = "#3ddc97"
+
+FONT = "Segoe UI"
+MONO = "Consolas"
+
+
 class AppWindow:
     _ENGINE_OPTIONS = [
         ("easyocr", "EasyOCR (accurate, slower)"),
         ("tesseract", "Tesseract (fast, local)"),
         ("claude_vision", "Claude Vision (in development)"),
         ("gemini_vision", "Gemini Vision (in development)"),
+    ]
+
+    _MODE_TABS = [
+        ("single", "Single"),
+        ("multi", "Multi-Select"),
+        ("grid", "Grid Scan"),
     ]
 
     def __init__(
@@ -49,18 +76,22 @@ class AppWindow:
 
         self.root = tk.Tk()
         self.root.title("WF-PriceTracker")
-        self.root.geometry("470x560")
-        self.root.minsize(380, 420)
+        self.root.geometry("520x700")
+        self.root.minsize(440, 560)
+        self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.status_var = tk.StringVar(value="Idle")
-        self.box_size_var = tk.StringVar(value="Box size: not set")
+        self.box_size_var = tk.StringVar(value="Not set")
+        self.grid_info_var = tk.StringVar(value="Not calibrated")
         self.topmost_var = tk.BooleanVar(value=False)
         self.engine_var = tk.StringVar()
         self.selection_mode_var = tk.StringVar(value="single")
         self.price_workers_var = tk.IntVar(value=1)
         self.price_workers_label_var = tk.StringVar(value="")
         self._current_engine_key = "tesseract"
+        self._tabs: dict[str, tuple[tk.Label, tk.Frame]] = {}
+        self._panels: dict[str, tk.Frame] = {}
 
         self._on_toggle_scan = on_toggle_scan
         self._on_scan_now = on_scan_now
@@ -74,6 +105,7 @@ class AppWindow:
         self._on_price_workers_change = on_price_workers_change
         self._on_quit = on_quit
 
+        self._init_style()
         self._build_widgets()
         self._poll_queue()
 
@@ -84,112 +116,341 @@ class AppWindow:
         self._multi_result_overlay = MultiResultOverlay(self.root)
         self._grid_outline_overlay = GridOutlineOverlay(self.root)
 
+    # --- theme ------------------------------------------------------------
+    def _init_style(self) -> None:
+        """Restyles the handful of ttk widgets that have no usable tk
+        equivalent (combobox, slider, scrollbar) to match the palette.
+
+        Built on "clam" because the native Windows themes ignore most colour
+        options - they draw themselves from the OS visual style, so a
+        background= on the default theme silently does nothing.
+        """
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            log.warning("clam ttk theme unavailable; widgets may not match the dark palette")
+
+        # clam draws a light/dark bevel and a border around the combobox by
+        # default (the white ring); collapse all of those onto surface/border
+        # colours so it reads as one flat field with a hairline edge.
+        style.configure(
+            "TCombobox",
+            borderwidth=1, arrowsize=14, padding=6,
+            bordercolor=BORDER, lightcolor=SURFACE_HI, darkcolor=SURFACE_HI,
+            insertcolor=TEXT,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", SURFACE_HI)],
+            background=[("readonly", SURFACE_HI)],  # the arrow button box
+            foreground=[("readonly", TEXT)],
+            arrowcolor=[("readonly", ACCENT), ("disabled", TEXT_DIM)],
+            bordercolor=[("focus", ACCENT_DIM), ("!focus", BORDER)],
+            lightcolor=[("focus", ACCENT_DIM), ("!focus", SURFACE_HI)],
+            darkcolor=[("focus", ACCENT_DIM), ("!focus", SURFACE_HI)],
+            selectbackground=[("readonly", SURFACE_HI)],  # kill the blue "selected text" band
+            selectforeground=[("readonly", TEXT)],
+        )
+        # The dropdown is a plain Tk listbox owned by Tk itself, so it's
+        # reachable only through the option database, not through ttk.Style.
+        self.root.option_add("*TCombobox*Listbox.background", SURFACE_HI)
+        self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT_DIM)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.borderWidth", 0)
+
+        # background = the slider grip; troughcolor = the bar. bordercolor has
+        # to be pinned to the trough colour too or clam frames the bar in a
+        # bright 1px ring.
+        style.configure(
+            "Accent.Horizontal.TScale",
+            background=ACCENT, troughcolor=SURFACE_HI, borderwidth=0,
+            bordercolor=SURFACE_HI, lightcolor=ACCENT, darkcolor=ACCENT_DIM,
+        )
+        style.map("Accent.Horizontal.TScale", background=[("active", "#6ee8f5")])
+        style.configure(
+            "Dark.Vertical.TScrollbar",
+            background=SURFACE_HI, troughcolor=SURFACE, borderwidth=0,
+            arrowcolor=TEXT_DIM, bordercolor=SURFACE,
+        )
+        style.map("Dark.Vertical.TScrollbar", background=[("active", BORDER)])
+
+    # --- small styled building blocks -------------------------------------
+    def _card(self, parent: tk.Misc, **pack_kw) -> tk.Frame:
+        """A panel: one flat surface with a hairline border, no bevel."""
+        card = tk.Frame(parent, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1, bd=0)
+        card.pack(**pack_kw)
+        return card
+
+    def _section_label(self, parent: tk.Misc, text: str) -> tk.Label:
+        return tk.Label(
+            parent, text=text.upper(), bg=BG, fg=TEXT_DIM,
+            font=(FONT, 8, "bold"), anchor="w",
+        )
+
+    def _button(
+        self, parent: tk.Misc, text: str, command: Callable[[], None],
+        primary: bool = False, danger: bool = False, **pack_kw,
+    ) -> tk.Button:
+        """A flat button with a manual hover state.
+
+        tk.Button is used rather than ttk.Button because it takes plain
+        bg/fg/activebackground options - restyling ttk.Button's hover and
+        pressed states means fighting the theme's element layout for the same
+        result.
+        """
+        fg = BG if primary else (DANGER if danger else TEXT)
+        bg = ACCENT if primary else SURFACE_HI
+        hover = "#6ee8f5" if primary else BORDER
+        btn = tk.Button(
+            parent, text=text, command=command,
+            bg=bg, fg=fg, activebackground=hover, activeforeground=fg,
+            disabledforeground=TEXT_DIM, relief="flat", bd=0, highlightthickness=0,
+            font=(FONT, 10, "bold" if primary else "normal"),
+            cursor="hand2", pady=8, padx=10,
+        )
+        # Bound rather than relying on activebackground: that only applies
+        # while the mouse is DOWN, which reads as no hover feedback at all.
+        btn.bind("<Enter>", lambda _e: btn["state"] == "normal" and btn.config(bg=hover))
+        btn.bind("<Leave>", lambda _e: btn.config(bg=bg))
+        btn._rest_bg = bg  # so _set_button_enabled can restore it
+        if pack_kw:
+            btn.pack(**pack_kw)
+        return btn
+
+    @staticmethod
+    def _set_button_enabled(btn: tk.Button, enabled: bool) -> None:
+        btn.config(
+            state="normal" if enabled else "disabled",
+            bg=btn._rest_bg if enabled else SURFACE,
+            cursor="hand2" if enabled else "arrow",
+        )
+
     def _build_widgets(self) -> None:
-        pad = {"padx": 10, "pady": 6}
+        self._build_header()
+        self._build_tab_bar()
+        self._build_mode_panels()
+        self._build_actions()
+        self._build_settings()
+        self._build_log()
+        self._build_footer()
+        self._apply_mode_ui(self.selection_mode_var.get())
 
-        status_frame = ttk.Frame(self.root)
-        status_frame.pack(fill="x", **pad)
-        ttk.Label(status_frame, textvariable=self.status_var, font=("Segoe UI", 14, "bold")).pack(side="left")
-        ttk.Label(status_frame, textvariable=self.box_size_var, font=("Segoe UI", 10)).pack(side="right")
+    def _build_header(self) -> None:
+        header = tk.Frame(self.root, bg=BG)
+        header.pack(fill="x", padx=16, pady=(14, 10))
+        tk.Label(
+            header, text="WF-PriceTracker", bg=BG, fg=TEXT, font=(FONT, 15, "bold")
+        ).pack(side="left")
 
-        mode_frame = ttk.Frame(self.root)
-        mode_frame.pack(fill="x", **pad)
-        ttk.Label(mode_frame, text="Selection Mode:").pack(side="left")
-        ttk.Radiobutton(
-            mode_frame, text="Single Item", value="single", variable=self.selection_mode_var,
-            command=self._on_selection_mode_selected,
-        ).pack(side="left", padx=(6, 0))
-        ttk.Radiobutton(
-            mode_frame, text="Multi-Select", value="multi", variable=self.selection_mode_var,
-            command=self._on_selection_mode_selected,
-        ).pack(side="left", padx=(6, 0))
-        ttk.Radiobutton(
-            mode_frame, text="Grid Scan", value="grid", variable=self.selection_mode_var,
-            command=self._on_selection_mode_selected,
-        ).pack(side="left", padx=(6, 0))
+        # Status reads as a pill: a coloured dot plus the text, so scan state
+        # is legible at a glance from across the screen.
+        pill = tk.Frame(header, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        pill.pack(side="right")
+        self.status_dot = tk.Label(pill, text="●", bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9))
+        self.status_dot.pack(side="left", padx=(8, 4), pady=3)
+        tk.Label(
+            pill, textvariable=self.status_var, bg=SURFACE, fg=TEXT, font=(FONT, 9, "bold")
+        ).pack(side="left", padx=(0, 10), pady=3)
 
-        btn_frame = ttk.Frame(self.root)
-        btn_frame.pack(fill="x", **pad)
-        self.toggle_btn = ttk.Button(btn_frame, text="Start Scan Mode (F10)", command=self._on_toggle_scan)
-        self.toggle_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
-        self.scan_now_btn = ttk.Button(btn_frame, text="Scan Now (F9)", command=self._on_scan_now)
-        self.scan_now_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
+    def _build_tab_bar(self) -> None:
+        """The three selection modes as a tab strip. Picking a tab IS picking
+        the mode - there's no separate mode control anymore, so the tab a user
+        is looking at always matches what F9/F10 will actually do.
+        """
+        bar = tk.Frame(self.root, bg=BG)
+        bar.pack(fill="x", padx=16)
+        for mode, label in self._MODE_TABS:
+            holder = tk.Frame(bar, bg=BG)
+            holder.pack(side="left", expand=True, fill="x")
+            tab = tk.Label(
+                holder, text=label, bg=BG, fg=TEXT_DIM,
+                font=(FONT, 10), cursor="hand2", pady=8,
+            )
+            tab.pack(fill="x")
+            # The underline is the selected-state marker; an unselected tab
+            # keeps a same-height strip in the background colour so switching
+            # tabs doesn't shift the layout by 2px.
+            underline = tk.Frame(holder, bg=BORDER, height=2)
+            underline.pack(fill="x")
+            tab.bind("<Button-1>", lambda _e, m=mode: self._on_tab_clicked(m))
+            tab.bind("<Enter>", lambda _e, m=mode: self._on_tab_hover(m, True))
+            tab.bind("<Leave>", lambda _e, m=mode: self._on_tab_hover(m, False))
+            self._tabs[mode] = (tab, underline)
 
-        setup_frame = ttk.Frame(self.root)
-        setup_frame.pack(fill="x", **pad)
-        ttk.Button(setup_frame, text="Set Item Box Size...", command=self._on_set_box_size).pack(
-            side="left", expand=True, fill="x", padx=(0, 4)
+    def _build_mode_panels(self) -> None:
+        """One card per mode, holding ONLY that mode's own settings. Exactly
+        one is packed at a time (see _apply_mode_ui)."""
+        self._panel_host = tk.Frame(self.root, bg=BG)
+        self._panel_host.pack(fill="x", padx=16, pady=(12, 0))
+
+        self._panels["single"] = self._build_single_panel()
+        self._panels["multi"] = self._build_multi_panel()
+        self._panels["grid"] = self._build_grid_panel()
+
+    def _panel_body(self, blurb: str) -> tuple[tk.Frame, tk.Frame]:
+        """Shared shell for a mode panel: an explanatory line plus a body
+        frame for that mode's own controls. Returns (card, body)."""
+        card = tk.Frame(self._panel_host, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        tk.Label(
+            card, text=blurb, bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9),
+            wraplength=430, justify="left", anchor="w",
+        ).pack(fill="x", padx=14, pady=(12, 0))
+        body = tk.Frame(card, bg=SURFACE)
+        body.pack(fill="x", padx=14, pady=12)
+        return card, body
+
+    def _stat_row(self, parent: tk.Misc, label: str, var: tk.StringVar) -> None:
+        """A labelled read-only value (calibration state), accent-coloured so
+        "is this set up yet?" is answerable without reading the log."""
+        row = tk.Frame(parent, bg=SURFACE)
+        row.pack(fill="x", pady=(10, 0))
+        tk.Label(row, text=label, bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9)).pack(side="left")
+        tk.Label(row, textvariable=var, bg=SURFACE, fg=ACCENT, font=(FONT, 9, "bold")).pack(side="left", padx=(6, 0))
+
+    def _build_single_panel(self) -> tk.Frame:
+        card, body = self._panel_body(
+            "Hover an item in-game and press F9. Grabs a fixed-size box centred on "
+            "the cursor, then prices whatever it reads."
         )
-        ttk.Button(setup_frame, text="Refresh Item List", command=self._on_refresh_catalog).pack(
-            side="left", expand=True, fill="x", padx=(4, 0)
+        self._button(
+            body, "Set Item Box Size…", self._on_set_box_size, fill="x"
+        )
+        self._stat_row(body, "Box size:", self.box_size_var)
+        return card
+
+    def _build_multi_panel(self) -> tk.Frame:
+        card, body = self._panel_body(
+            "Drag a box around any number of items. On release the whole region is "
+            "scanned and every item found is labelled in place with its price."
+        )
+        tk.Label(
+            body, text="Nothing to configure — drag anywhere once scan mode is on.",
+            bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9, "italic"), anchor="w",
+        ).pack(fill="x")
+        return card
+
+    def _build_grid_panel(self) -> tk.Frame:
+        card, body = self._panel_body(
+            "Calibrate a fixed grid of inventory slots once, then F9 reads every "
+            "slot's name band and prices the lot."
+        )
+        self.calibrate_grid_btn = self._button(
+            body, "Calibrate Grid…", self._on_calibrate_grid, fill="x"
+        )
+        self._stat_row(body, "Grid:", self.grid_info_var)
+        return card
+
+    def _build_actions(self) -> None:
+        actions = tk.Frame(self.root, bg=BG)
+        actions.pack(fill="x", padx=16, pady=(12, 0))
+        self.toggle_btn = self._button(
+            actions, "Start Scan Mode (F10)", self._on_toggle_scan, primary=True,
+            side="left", expand=True, fill="x", padx=(0, 5),
+        )
+        self.scan_now_btn = self._button(
+            actions, "Scan Now (F9)", self._on_scan_now,
+            side="left", expand=True, fill="x", padx=(5, 0),
         )
 
-        grid_frame = ttk.Frame(self.root)
-        grid_frame.pack(fill="x", padx=10, pady=(0, 6))
-        self.calibrate_grid_btn = ttk.Button(
-            grid_frame, text="Calibrate Grid... (for Grid Scan)", command=self._on_calibrate_grid
-        )
-        self.calibrate_grid_btn.pack(fill="x")
+    def _build_settings(self) -> None:
+        self._section_label(self.root, "Settings").pack(fill="x", padx=16, pady=(16, 4))
+        card = self._card(self.root, fill="x", padx=16)
 
-        engine_frame = ttk.Frame(self.root)
-        engine_frame.pack(fill="x", **pad)
-        ttk.Label(engine_frame, text="OCR Engine:").pack(side="left")
+        engine_row = tk.Frame(card, bg=SURFACE)
+        engine_row.pack(fill="x", padx=14, pady=(12, 0))
+        tk.Label(engine_row, text="OCR engine", bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9)).pack(anchor="w")
         self.engine_combo = ttk.Combobox(
-            engine_frame,
+            engine_row,
             textvariable=self.engine_var,
             values=[label for _key, label in self._ENGINE_OPTIONS],
             state="readonly",
         )
-        self.engine_combo.pack(side="left", expand=True, fill="x", padx=(6, 0))
+        self.engine_combo.pack(fill="x", pady=(4, 0))
         self.engine_combo.bind("<<ComboboxSelected>>", self._on_engine_selected)
 
-        key_frame = ttk.Frame(self.root)
-        key_frame.pack(fill="x", padx=10, pady=(0, 6))
-        # Disabled for now - Claude/Gemini Vision are still in development
-        # (see config.DISABLED_ENGINES). Re-enabling these is just removing
-        # state="disabled" once those engines are ready.
-        self.anthropic_key_btn = ttk.Button(
-            key_frame, text="Set Anthropic Key...", command=self._prompt_anthropic_key, state="disabled"
-        )
-        self.anthropic_key_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
-        self.google_key_btn = ttk.Button(
-            key_frame, text="Set Google Key...", command=self._prompt_google_key, state="disabled"
-        )
-        self.google_key_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
-
-        speed_frame = ttk.Frame(self.root)
-        speed_frame.pack(fill="x", padx=10, pady=(0, 2))
-        ttk.Label(speed_frame, textvariable=self.price_workers_label_var).pack(side="left")
+        speed_row = tk.Frame(card, bg=SURFACE)
+        speed_row.pack(fill="x", padx=14, pady=(12, 0))
+        tk.Label(
+            speed_row, textvariable=self.price_workers_label_var,
+            bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9),
+        ).pack(anchor="w")
         self.price_workers_scale = ttk.Scale(
-            speed_frame,
+            speed_row,
             from_=config.PRICE_FETCH_WORKERS_MIN,
             to=config.PRICE_FETCH_WORKERS_MAX,
             orient="horizontal",
+            style="Accent.Horizontal.TScale",
             command=self._on_price_workers_scale,
         )
-        self.price_workers_scale.pack(side="left", expand=True, fill="x", padx=(6, 0))
-        ttk.Label(
-            self.root,
+        self.price_workers_scale.pack(fill="x", pady=(4, 0))
+        tk.Label(
+            speed_row,
             text="Higher = faster scans, but warframe.market may rate-limit your IP above ~3.",
-            foreground="gray", font=("Segoe UI", 8),
-        ).pack(fill="x", padx=10, pady=(0, 6))
+            bg=SURFACE, fg=TEXT_DIM, font=(FONT, 8), wraplength=430, justify="left", anchor="w",
+        ).pack(fill="x", pady=(4, 0))
 
-        log_frame = ttk.Frame(self.root)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
-        self.log_box = tk.Listbox(log_frame, font=("Consolas", 9), activestyle="none")
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_box.yview)
+        key_row = tk.Frame(card, bg=SURFACE)
+        key_row.pack(fill="x", padx=14, pady=12)
+        self._button(key_row, "Refresh Item List", self._on_refresh_catalog,
+                     side="left", expand=True, fill="x", padx=(0, 5))
+        # Disabled for now - Claude/Gemini Vision are still in development
+        # (see config.DISABLED_ENGINES). Re-enabling these is just dropping
+        # the _set_button_enabled(False) calls once those engines are ready.
+        self.anthropic_key_btn = self._button(
+            key_row, "Anthropic Key…", self._prompt_anthropic_key,
+            side="left", expand=True, fill="x", padx=(5, 5),
+        )
+        self.google_key_btn = self._button(
+            key_row, "Google Key…", self._prompt_google_key,
+            side="left", expand=True, fill="x", padx=(5, 0),
+        )
+        self._set_button_enabled(self.anthropic_key_btn, False)
+        self._set_button_enabled(self.google_key_btn, False)
+
+    def _build_log(self) -> None:
+        self._section_label(self.root, "Activity").pack(fill="x", padx=16, pady=(16, 4))
+        log_frame = tk.Frame(self.root, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        log_frame.pack(fill="both", expand=True, padx=16)
+        self.log_box = tk.Listbox(
+            log_frame, font=(MONO, 9), activestyle="none",
+            bg=SURFACE, fg=TEXT_DIM, selectbackground=SURFACE_HI, selectforeground=TEXT,
+            relief="flat", bd=0, highlightthickness=0,
+        )
+        scrollbar = ttk.Scrollbar(
+            log_frame, orient="vertical", command=self.log_box.yview, style="Dark.Vertical.TScrollbar"
+        )
         self.log_box.configure(yscrollcommand=scrollbar.set)
-        self.log_box.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self.log_box.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        scrollbar.pack(side="right", fill="y", pady=6, padx=(0, 4))
 
-        bottom = ttk.Frame(self.root)
-        bottom.pack(fill="x", **pad)
-        ttk.Checkbutton(
-            bottom, text="Always on top", variable=self.topmost_var, command=self._apply_topmost
+    def _build_footer(self) -> None:
+        bottom = tk.Frame(self.root, bg=BG)
+        bottom.pack(fill="x", padx=16, pady=12)
+        tk.Checkbutton(
+            bottom, text="Always on top", variable=self.topmost_var, command=self._apply_topmost,
+            bg=BG, fg=TEXT_DIM, selectcolor=SURFACE_HI, activebackground=BG, activeforeground=TEXT,
+            font=(FONT, 9), relief="flat", bd=0, highlightthickness=0, cursor="hand2",
         ).pack(side="left")
-        ttk.Button(bottom, text="Quit", command=self._on_quit).pack(side="right")
-        self.hint_var = tk.StringVar(value="F10: toggle scan mode   F9: scan at cursor   Ctrl+F10: quit")
-        ttk.Label(bottom, textvariable=self.hint_var, foreground="gray").pack(side="right", padx=8)
+        self._button(bottom, "Quit", self._on_quit, danger=True, side="right")
+        self.hint_var = tk.StringVar(value="F10 toggle   ·   F9 scan at cursor   ·   Ctrl+F10 quit")
+        tk.Label(
+            bottom, textvariable=self.hint_var, bg=BG, fg=TEXT_DIM, font=(FONT, 8)
+        ).pack(side="right", padx=10)
+
+    # --- tab interaction ---------------------------------------------------
+    def _on_tab_clicked(self, mode: str) -> None:
+        if mode == self.selection_mode_var.get():
+            return
+        self.selection_mode_var.set(mode)
+        self._on_selection_mode_selected()
+
+    def _on_tab_hover(self, mode: str, entering: bool) -> None:
+        if mode == self.selection_mode_var.get():
+            return  # the selected tab already has its own colours
+        tab, _underline = self._tabs[mode]
+        tab.config(fg=TEXT if entering else TEXT_DIM)
 
     def _apply_topmost(self) -> None:
         self.root.attributes("-topmost", self.topmost_var.get())
@@ -211,17 +472,28 @@ class AppWindow:
         self.call_soon(_set)
 
     def _apply_mode_ui(self, mode: str) -> None:
+        # Show only the active mode's panel, and mark its tab.
+        for m, (tab, underline) in self._tabs.items():
+            selected = m == mode
+            tab.config(fg=ACCENT if selected else TEXT_DIM, font=(FONT, 10, "bold" if selected else "normal"))
+            underline.config(bg=ACCENT if selected else BORDER)
+        for m, panel in self._panels.items():
+            if m == mode:
+                panel.pack(fill="x")
+            else:
+                panel.pack_forget()
+
         # F9 ("Scan Now") is meaningful in Single (scan at cursor) and Grid
         # (scan the whole grid), but not in Multi (there you drag instead).
         if mode == "multi":
-            self.scan_now_btn.state(["disabled"])
-            self.hint_var.set("F10: toggle scan mode   drag to select & scan   Ctrl+F10: quit")
+            self._set_button_enabled(self.scan_now_btn, False)
+            self.hint_var.set("F10 toggle   ·   drag to select & scan   ·   Ctrl+F10 quit")
         elif mode == "grid":
-            self.scan_now_btn.state(["!disabled"])
-            self.hint_var.set("F10: toggle scan mode   F9: scan grid   Ctrl+F10: quit")
+            self._set_button_enabled(self.scan_now_btn, True)
+            self.hint_var.set("F10 toggle   ·   F9 scan grid   ·   Ctrl+F10 quit")
         else:  # single
-            self.scan_now_btn.state(["!disabled"])
-            self.hint_var.set("F10: toggle scan mode   F9: scan at cursor   Ctrl+F10: quit")
+            self._set_button_enabled(self.scan_now_btn, True)
+            self.hint_var.set("F10 toggle   ·   F9 scan at cursor   ·   Ctrl+F10 quit")
 
     def _on_price_workers_scale(self, raw: str) -> None:
         # ttk.Scale is continuous; snap to an int and only fire the persist
@@ -322,13 +594,32 @@ class AppWindow:
         self.root.after(0, func)
 
     def set_status(self, text: str) -> None:
-        self.call_soon(lambda: self.status_var.set(text))
+        # The dot colour tracks scan state: accent when a scan mode is live,
+        # dim otherwise. "Idle" is the only resting state main.py sets.
+        active = text != "Idle"
+
+        def _set() -> None:
+            self.status_var.set(text)
+            self.status_dot.config(fg=ACCENT if active else TEXT_DIM)
+
+        self.call_soon(_set)
 
     def set_box_size_label(self, text: str) -> None:
-        self.call_soon(lambda: self.box_size_var.set(text))
+        # main.py passes "Box size: WxHpx"; the panel already labels the field
+        # "Box size:", so strip a redundant leading label if present.
+        value = text.split(":", 1)[1].strip() if text.startswith("Box size:") else text
+        self.call_soon(lambda: self.box_size_var.set(value))
+
+    def set_grid_info_label(self, text: str) -> None:
+        self.call_soon(lambda: self.grid_info_var.set(text))
 
     def set_toggle_label(self, text: str) -> None:
-        self.call_soon(lambda: self.toggle_btn.config(text=text))
+        # The primary button keeps its accent bg through label changes.
+        def _set() -> None:
+            self.toggle_btn.config(text=text)
+            self.toggle_btn._rest_bg = ACCENT
+
+        self.call_soon(_set)
 
     def show(self) -> None:
         def _show() -> None:
@@ -578,7 +869,7 @@ class SnipOverlay(tk.Toplevel):
         if self._rect_id is not None:
             self.canvas.delete(self._rect_id)
         cx, cy = self._to_canvas(x, y)
-        self._rect_id = self.canvas.create_rectangle(cx, cy, cx, cy, outline="#4ddbea", width=2)
+        self._rect_id = self.canvas.create_rectangle(cx, cy, cx, cy, outline=ACCENT, width=2)
         self.deiconify()
         self.lift()
 
@@ -640,7 +931,7 @@ class CursorBoxOverlay(tk.Toplevel):
         self._box_w, self._box_h = box_w, box_h
         if self._rect_id is not None:
             self.canvas.delete(self._rect_id)
-        self._rect_id = self.canvas.create_rectangle(0, 0, 0, 0, outline="#4ddbea", width=2)
+        self._rect_id = self.canvas.create_rectangle(0, 0, 0, 0, outline=ACCENT, width=2)
         self.move_to(x, y)
         self.deiconify()
         self.lift()
@@ -710,16 +1001,16 @@ class MultiResultOverlay(tk.Toplevel):
         pad = 4
 
         name_id = self.canvas.create_text(
-            cx + pad, cy + pad, text=name, anchor="nw", fill="#4ddbea", font=("Segoe UI", 9, "bold")
+            cx + pad, cy + pad, text=name, anchor="nw", fill=ACCENT, font=("Segoe UI", 9, "bold")
         )
         price_id = self.canvas.create_text(
-            cx + pad, cy + pad + 14, text=price_text, anchor="nw", fill="#dddddd", font=("Segoe UI", 8)
+            cx + pad, cy + pad + 14, text=price_text, anchor="nw", fill=TEXT, font=("Segoe UI", 8)
         )
         name_box = self.canvas.bbox(name_id)
         price_box = self.canvas.bbox(price_id)
         right = max(name_box[2], price_box[2]) + pad
         bottom = price_box[3] + pad
-        bg_id = self.canvas.create_rectangle(cx, cy, right, bottom, fill="#121214", outline="#4ddbea", width=1)
+        bg_id = self.canvas.create_rectangle(cx, cy, right, bottom, fill=SURFACE, outline=ACCENT, width=1)
         self.canvas.tag_lower(bg_id, name_id)
 
         self._item_ids.extend([bg_id, name_id, price_id])
@@ -899,7 +1190,7 @@ class GridOutlineOverlay(tk.Toplevel):
         ox, oy = self._offset
         for (x, y, w, h) in rects:
             rid = self.canvas.create_rectangle(
-                x - ox, y - oy, x - ox + w, y - oy + h, outline="#4ddbea", width=1
+                x - ox, y - oy, x - ox + w, y - oy + h, outline=ACCENT, width=1
             )
             self._rect_ids.append(rid)
         self.deiconify()
@@ -926,14 +1217,14 @@ class ResultPopup(tk.Toplevel):
         except tk.TclError:
             pass
 
-        frame = tk.Frame(self, bg="#121214", highlightbackground="#4ddbea", highlightthickness=1)
+        frame = tk.Frame(self, bg=SURFACE, highlightbackground=ACCENT, highlightthickness=1)
         frame.pack()
         for i, line in enumerate(lines):
             tk.Label(
                 frame,
                 text=line,
-                bg="#121214",
-                fg="#4ddbea" if i == 0 else "#dddddd",
+                bg=SURFACE,
+                fg=ACCENT if i == 0 else TEXT,
                 font=("Segoe UI", 11, "bold") if i == 0 else ("Segoe UI", 9),
                 justify="left",
                 anchor="w",

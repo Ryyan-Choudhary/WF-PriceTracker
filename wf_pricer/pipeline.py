@@ -52,10 +52,22 @@ def price_crop(image: Image.Image, items_index: ItemsIndex) -> tuple[ScanResult 
     candidates: list[str] = []
     if len(lines) > 1:
         ordered = sorted(lines, key=lambda l: l.bbox[1])
-        candidates.append(" ".join(l.text for l in ordered))
+        # Stop joining at the first big vertical gap. Even a single-item scan
+        # box can clip the tile below, and gluing that tile's name on turns a
+        # readable name into an unmatchable run-on. A gap wider than the line
+        # itself is tall means a new tile, not a wrapped continuation.
+        joined_parts = [ordered[0].text]
+        for prev, line in zip(ordered, ordered[1:]):
+            if line.bbox[1] - (prev.bbox[1] + prev.bbox[3]) > prev.bbox[3]:
+                break
+            joined_parts.append(line.text)
+        if len(joined_parts) > 1:
+            candidates.append(" ".join(joined_parts))
     candidates.extend(line.text for line in lines)
 
-    for candidate_text in candidates:
+    # A single-line join is just that line again, and OCR can repeat a line
+    # verbatim; matching is the expensive step here, so don't redo it.
+    for candidate_text in dict.fromkeys(candidates):
         item = items_index.match(candidate_text)
         if item is None:
             continue

@@ -182,6 +182,9 @@ class App:
     def _on_grid_calibrated(self, grid: dict) -> None:
         config.save_grid_calibration(grid)
         if self.window:
+            self.window.set_grid_info_label(
+                f"{grid['rows']}x{grid['cols']} slots, band {grid['band_w']}x{grid['band_h']}px"
+            )
             self.window.log(
                 f"Grid calibrated: {grid['rows']}x{grid['cols']} slots, "
                 f"band {grid['band_w']}x{grid['band_h']}px."
@@ -554,6 +557,11 @@ def main() -> None:
         window.set_box_size_label(f"Box size: {config.BOX_WIDTH_PX}x{config.BOX_HEIGHT_PX}px")
     else:
         window.log('Set your item box size first ("Set Item Box Size..." button) before scanning.')
+    if config.GRID is not None:
+        window.set_grid_info_label(
+            f"{config.GRID['rows']}x{config.GRID['cols']} slots, "
+            f"band {config.GRID['band_w']}x{config.GRID['band_h']}px"
+        )
     window.log("WF-PriceTracker ready. Loading item catalog...")
     if config.OCR_ENGINE == "easyocr":
         window.log("(First EasyOCR run will download its model weights - needs internet, one-time.)")

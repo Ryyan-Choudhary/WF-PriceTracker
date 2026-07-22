@@ -130,7 +130,7 @@ GRID_SCAN_FRAME_DELAY_S = 0.12
 # rescues slots where one particular threshold mangled the text. Slots still
 # unidentified after every attempt get flagged UNREADABLE rather than
 # silently left blank, so you can tell "couldn't read it" from "empty slot".
-GRID_SCAN_MAX_RETRY_PROFILES = 6  # extra profiles beyond the default first pass
+GRID_SCAN_MAX_RETRY_PROFILES = 3  # extra profiles beyond the default first pass
 
 # --- Selection mode ------------------------------------------------------
 # "single" - hover an item, press the scan hotkey; grabs a fixed-size box
@@ -176,6 +176,11 @@ REQUEST_DELAY_SECONDS = 0.3  # be polite: each price-fetch worker waits this lon
 # TTLs
 ITEMS_CACHE_TTL_SECONDS = 3 * 24 * 3600   # item catalog barely changes; 3 days
 PRICE_CACHE_TTL_SECONDS = 10 * 60         # prices move; 10 minutes
+# Quiet period before the price cache is written to disk. A grid scan resolves
+# dozens of prices in a burst, and rewriting the whole JSON file per price is
+# pure overhead; the write is deferred until the burst stops (and forced on
+# exit, see market._flush_on_shutdown).
+PRICE_CACHE_WRITE_DELAY_S = 0.3
 
 # How many item prices to fetch from warframe.market at once. 1 = fully
 # sequential (the original, safest behavior - roughly matches their ~3 req/s
@@ -183,7 +188,7 @@ PRICE_CACHE_TTL_SECONDS = 10 * 60         # prices move; 10 minutes
 # faster scans, but issues requests faster too: warframe.market may return
 # HTTP 429 / temporarily rate-limit your IP if you push it too high. Exposed
 # as a slider in the window; persisted here.
-PRICE_FETCH_WORKERS = 1
+PRICE_FETCH_WORKERS = 3
 PRICE_FETCH_WORKERS_MIN = 1
 PRICE_FETCH_WORKERS_MAX = 8
 PRICE_FETCH_FILE = CACHE_DIR / "price_fetch.json"
@@ -378,7 +383,7 @@ def clear_google_api_key() -> None:
     GOOGLE_API_KEY_FILE.unlink(missing_ok=True)
 
 # --- Item matching -----------------------------------------------------
-FUZZY_MATCH_SCORE_CUTOFF = 84  # 0-100, higher = stricter (fewer false positives)
+FUZZY_MATCH_SCORE_CUTOFF = 86  # 0-100, higher = stricter (fewer false positives)
 # If the best match doesn't beat the second-best by at least this many
 # points, treat it as ambiguous and refuse to match at all, rather than
 # arbitrarily picking one. This matters a lot for Prime parts: OCR text
@@ -387,6 +392,29 @@ FUZZY_MATCH_SCORE_CUTOFF = 84  # 0-100, higher = stricter (fewer false positives
 # scan box cut it off) scores an exact tie against ALL of that frame's
 # parts, and picking one anyway means silently reporting the wrong item.
 FUZZY_MATCH_MIN_MARGIN = 3
+# How many top-scoring candidates to pull back for the ambiguity check. Needs
+# to be more than 2 so a genuine tie between several parts of the same frame
+# is seen as the whole group, not just its first two members - the word runoff
+# below can only separate candidates it was actually shown.
+FUZZY_MATCH_CANDIDATES = 5
+
+# --- Word runoff (tie-break) -------------------------------------------
+# When the overall scores above can't separate the top candidates, compare
+# them one word at a time instead of giving up: first word against first word,
+# and only if THAT draws, second, then third. A frame's parts are identical
+# until the part-specific word ("Volt Prime NEUROPTICS Blueprint" vs "Volt
+# Prime SYSTEMS Blueprint"), so the whole-string scores tie while the third
+# word separates them cleanly.
+# The runoff deliberately stops at the query's own last word, which is what
+# keeps a genuinely incomplete read refused: "Titania Prime" draws on both of
+# its words against every Titania part and simply runs out of evidence.
+FUZZY_TIEBREAK_MAX_WORDS = 3   # positions examined - "first, second, or third"
+FUZZY_TIEBREAK_MIN_MARGIN = 8  # per-word points needed to call a position decided
+# A candidate has to account for most of the text to win a runoff. Without
+# this, OCR that smears two adjacent tiles into one line ("Paris Prime Upper
+# Limb Perigale Prime Receiver") would let whichever item owns the first words
+# win outright, silently reporting one item and dropping the other.
+FUZZY_TIEBREAK_MAX_EXTRA_WORDS = 2
 
 # Matching runs in two stages (see items_db.ItemsIndex.match):
 #   1. ANCHOR - find which item "families" the text could belong to, by
@@ -396,9 +424,9 @@ FUZZY_MATCH_MIN_MARGIN = 3
 # Anchoring on the distinctive base name is what stops a garbled middle
 # ("Atlas Pfime'thassis Blueprint") from being dragged off to an unrelated
 # item that happens to share generic words like "Prime Blueprint".
-FUZZY_ANCHOR_SCORE_CUTOFF = 78  # how close a word must be to a base name to pull in that family
+FUZZY_ANCHOR_SCORE_CUTOFF = 65  # how close a word must be to a base name to pull in that family
 FUZZY_ANCHOR_MIN_TOKEN_LEN = 3  # ignore tiny OCR specks ("O2", "a", "4") when anchoring
-FUZZY_ANCHOR_MAX_FAMILIES = 6   # families pulled in per word of the text
+FUZZY_ANCHOR_MAX_FAMILIES = 10   # families pulled in per word of the text
 
 # --- Pricing -----------------------------------------------------------
 # How many of the cheapest current sell orders to average together.
