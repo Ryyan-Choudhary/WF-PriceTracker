@@ -234,3 +234,203 @@ _ENGINES = {
     "claude_vision": _extract_lines_claude_vision,
     "gemini_vision": _extract_lines_gemini_vision,
 }
+
+
+# --- Grid Scan name-band reading -------------------------------------------
+# A stronger preprocessing + one-OCR-call-per-frame path aimed at Warframe's
+# decorative item-card backgrounds, used only by Grid Scan mode.
+
+_BAND_MARGIN = 8  # blank rows between stacked bands in the montage
+
+
+def _preprocess_name_band(image: Image.Image) -> Image.Image:
+    """Contrast-boost + binarize a single slot's name band to isolate the
+    bright name text from the animated background art. Goes further than
+    _preprocess_for_tesseract (which the Single/Multi paths still use): after
+    grayscale + upscale + contrast stretch, it thresholds to near
+    black-and-white so the busy background collapses to one flat value and
+    only the bright glyphs survive. Returns dark-text-on-light (what
+    Tesseract prefers).
+    """
+    gray = image.convert("L")
+    factor = config.TESSERACT_UPSCALE_FACTOR
+    if factor != 1.0:
+        w, h = gray.size
+        gray = gray.resize((max(1, int(w * factor)), max(1, int(h * factor))), Image.LANCZOS)
+    gray = ImageOps.autocontrast(gray, cutoff=2)
+
+    arr = np.asarray(gray, dtype=np.uint8)
+    threshold = max(_otsu_threshold(arr), config.GRID_BINARIZE_CUTOFF)
+    # The name text is the BRIGHT part; keep pixels above the threshold as
+    # text. Produce dark text on a light background for Tesseract.
+    binary = np.where(arr >= threshold, 0, 255).astype(np.uint8)
+    return Image.fromarray(binary, mode="L")
+
+
+def _otsu_threshold(arr: np.ndarray) -> int:
+    """Otsu's method: the grayscale cutoff that best separates the histogram
+    into two classes (here, dark background vs. bright text)."""
+    hist = np.bincount(arr.ravel(), minlength=256).astype(np.float64)
+    total = arr.size
+    if total == 0:
+        return 128
+    sum_total = np.dot(np.arange(256), hist)
+    sum_b = 0.0
+    weight_b = 0.0
+    best_var = -1.0
+    best_t = 128
+    for t in range(256):
+        weight_b += hist[t]
+        if weight_b == 0:
+            continue
+        weight_f = total - weight_b
+        if weight_f == 0:
+            break
+        sum_b += t * hist[t]
+        mean_b = sum_b / weight_b
+        mean_f = (sum_total - sum_b) / weight_f
+        between = weight_b * weight_f * (mean_b - mean_f) ** 2
+        if between > best_var:
+            best_var = between
+            best_t = t
+    return best_t
+
+
+def read_name_bands(bands: list[Image.Image]) -> list[str]:
+    """Reads a list of pre-cropped slot name bands, returning one text string
+    per band (in input order, "" for a band with no legible text). Preprocesses
+    each band with _preprocess_name_band first.
+
+    For Tesseract this stacks the bands into ONE tall montage and OCRs it in a
+    single call (pytesseract spawns tesseract.exe per call, so per-band OCR of
+    a whole grid would be dozens of spawns), then maps each detected word back
+    to its band by vertical position. EasyOCR reads the montage in one call
+    too. The cloud vision engines have no batch path, so they fall back to one
+    call per band - slow and money per band, flagged as a known gap for grid
+    mode, same as multi-select.
+    """
+    if not bands:
+        return []
+    processed = [_preprocess_name_band(b) for b in bands]
+
+    engine = config.OCR_ENGINE
+    if engine == "tesseract":
+        return _read_name_bands_tesseract(processed)
+    if engine == "easyocr":
+        return _read_name_bands_easyocr(processed)
+    # claude_vision / gemini_vision: no batch API - one call per band.
+    reader = _ENGINES.get(engine, _extract_lines_easyocr)
+    results: list[str] = []
+    for band in processed:
+        lines = reader(band.convert("RGB"))
+        results.append(" ".join(l.text for l in lines).strip())
+    return results
+
+
+def _montage(bands: list[Image.Image]) -> tuple[Image.Image, list[tuple[int, int]]]:
+    """Stacks bands vertically on a white background with blank separators.
+    Returns (montage, band_y_spans) where band_y_spans[i] = (top, bottom) of
+    band i within the montage, used to map OCR results back to bands."""
+    width = max(b.width for b in bands)
+    height = sum(b.height for b in bands) + _BAND_MARGIN * (len(bands) + 1)
+    montage = Image.new("L", (width, height), 255)
+    spans: list[tuple[int, int]] = []
+    y = _BAND_MARGIN
+    for band in bands:
+        montage.paste(band, (0, y))
+        spans.append((y, y + band.height))
+        y += band.height + _BAND_MARGIN
+    return montage, spans
+
+
+def _read_name_bands_tesseract(bands: list[Image.Image]) -> list[str]:
+    import pytesseract
+    from pytesseract import Output
+
+    _configure_tesseract()
+    montage, spans = _montage(bands)
+    data = pytesseract.image_to_data(montage, config=config.TESSERACT_GRID_CONFIG, output_type=Output.DICT)
+
+    # (x, y, h, text) per band so we can reconstruct correct reading order.
+    words_per_band: list[list[tuple[float, float, float, str]]] = [[] for _ in bands]
+    n = len(data["text"])
+    for i in range(n):
+        text = (data["text"][i] or "").strip()
+        if not text:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1.0
+        if conf < config.TESSERACT_MIN_CONFIDENCE:
+            continue
+        top, height = data["top"][i], data["height"][i]
+        band_idx = _band_for_y(top + height / 2, spans)
+        if band_idx is not None:
+            words_per_band[band_idx].append((data["left"][i], top, height, text))
+
+    return [_words_to_text(words) for words in words_per_band]
+
+
+def _read_name_bands_easyocr(bands: list[Image.Image]) -> list[str]:
+    reader = _get_easyocr_reader()
+    montage, spans = _montage(bands)
+    array = np.array(montage.convert("RGB"))
+    detections = reader.readtext(array)
+
+    words_per_band: list[list[tuple[float, float, float, str]]] = [[] for _ in bands]
+    for points, text, conf in detections:
+        text = text.strip()
+        if not text or conf < config.OCR_MIN_CONFIDENCE:
+            continue
+        ys = [p[1] for p in points]
+        xs = [p[0] for p in points]
+        top, bottom = min(ys), max(ys)
+        band_idx = _band_for_y((top + bottom) / 2, spans)
+        if band_idx is not None:
+            words_per_band[band_idx].append((min(xs), top, bottom - top, text))
+
+    return [_words_to_text(words) for words in words_per_band]
+
+
+def _words_to_text(words: list[tuple[float, float, float, str]]) -> str:
+    """Reconstruct a band's text in true reading order from its detected
+    words (each (x, y, height, text)).
+
+    Warframe wraps a long item name onto two lines within a tile AND centers
+    each line, so a flat left-to-right sort scrambles the words (e.g.
+    "Caliban Prime" over a centered "Blueprint" would sort to "Caliban
+    Blueprint Prime"). Instead: group words into lines by vertical position,
+    order lines top-to-bottom, and order words within each line
+    left-to-right. This is what lets a wrapped name like "Caliban Prime
+    Blueprint" reassemble correctly and match cleanly instead of tying with
+    its "Caliban Prime Chassis Blueprint" sibling.
+    """
+    if not words:
+        return ""
+    words = sorted(words, key=lambda w: (w[1], w[0]))  # by y, then x
+    heights = sorted(w[2] for w in words)
+    line_h = heights[len(heights) // 2] or 1  # median word height
+
+    lines: list[list[tuple[float, float, float, str]]] = [[words[0]]]
+    line_top = words[0][1]
+    for w in words[1:]:
+        if w[1] - line_top > 0.6 * line_h:  # dropped to the next line
+            lines.append([w])
+            line_top = w[1]
+        else:
+            lines[-1].append(w)
+    parts = []
+    for line in lines:
+        line.sort(key=lambda w: w[0])
+        parts.append(" ".join(w[3] for w in line))
+    return " ".join(parts).strip()
+
+
+def _band_for_y(y: float, spans: list[tuple[int, int]]) -> int | None:
+    for idx, (top, bottom) in enumerate(spans):
+        # Allow the montage margin as slack so text sitting right at a band
+        # edge still maps to the right band.
+        if top - _BAND_MARGIN <= y <= bottom + _BAND_MARGIN:
+            return idx
+    return None

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import time
 from typing import Callable
 
 from PIL import Image, ImageGrab
@@ -65,6 +66,20 @@ def grab_region(left: int, top: int, right: int, bottom: int) -> Image.Image:
     right = min(vright, right)
     bottom = min(vbottom, bottom)
     return ImageGrab.grab(bbox=(left, top, right, bottom))
+
+
+def capture_frames(left: int, top: int, right: int, bottom: int, n: int, delay: float) -> list[Image.Image]:
+    """Grabs the same screen region n times, sleeping `delay` seconds between
+    grabs. Used by Grid Scan to capture a few rapid frames to vote across -
+    Warframe's animated item-card backgrounds render slightly differently
+    each frame, so voting across them beats background-induced OCR errors.
+    """
+    frames = []
+    for i in range(max(1, n)):
+        frames.append(grab_region(left, top, right, bottom))
+        if i < n - 1:
+            time.sleep(delay)
+    return frames
 
 
 class CursorTracker:

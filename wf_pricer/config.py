@@ -23,6 +23,7 @@ for _d in (CACHE_DIR, LOGS_DIR):
 ITEMS_CACHE_FILE = CACHE_DIR / "items.json"
 PRICE_CACHE_FILE = CACHE_DIR / "prices.json"
 BOX_CALIBRATION_FILE = CACHE_DIR / "box_calibration.json"
+GRID_CALIBRATION_FILE = CACHE_DIR / "grid_calibration.json"
 OCR_ENGINE_FILE = CACHE_DIR / "ocr_engine.json"
 ANTHROPIC_API_KEY_FILE = CACHE_DIR / "anthropic_api_key.json"
 GOOGLE_API_KEY_FILE = CACHE_DIR / "google_api_key.json"
@@ -77,13 +78,62 @@ def clear_box_calibration() -> None:
 
 load_box_calibration()
 
+# --- Inventory grid calibration (for Grid Scan mode) -----------------------
+# Describes a fixed R x C grid of item slots by the position/size of each
+# slot's NAME BAND (the small text label), derived from boxing the first
+# (top-left) and last (bottom-right) slot's name + entering rows/cols.
+# None until calibrated. GRID is a dict with keys:
+#   first_x, first_y   top-left of the first slot's name band (screen coords)
+#   band_w, band_h     name band size
+#   col_pitch, row_pitch  spacing between adjacent columns / rows
+#   rows, cols         grid dimensions
+GRID: dict | None = None
+_GRID_KEYS = ("first_x", "first_y", "band_w", "band_h", "col_pitch", "row_pitch", "rows", "cols")
+
+
+def load_grid_calibration() -> None:
+    global GRID
+    if not GRID_CALIBRATION_FILE.exists():
+        return
+    try:
+        data = json.loads(GRID_CALIBRATION_FILE.read_text(encoding="utf-8"))
+        GRID = {k: (int(data[k]) if k not in ("col_pitch", "row_pitch") else float(data[k])) for k in _GRID_KEYS}
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        GRID = None
+
+
+def save_grid_calibration(grid: dict) -> None:
+    global GRID
+    GRID = dict(grid)
+    GRID_CALIBRATION_FILE.write_text(json.dumps(GRID), encoding="utf-8")
+
+
+def clear_grid_calibration() -> None:
+    global GRID
+    GRID = None
+    GRID_CALIBRATION_FILE.unlink(missing_ok=True)
+
+
+load_grid_calibration()
+
+# How many rapid frames to capture and vote across per grid scan, and the
+# delay between them. Voting across frames beats OCR errors caused by
+# Warframe's animated item-card backgrounds (the same slot renders slightly
+# differently frame to frame).
+GRID_SCAN_FRAMES = 3
+GRID_SCAN_FRAME_DELAY_S = 0.12
+
 # --- Selection mode ------------------------------------------------------
 # "single" - hover an item, press the scan hotkey; grabs a fixed-size box
 #            (BOX_WIDTH_PX x BOX_HEIGHT_PX) centered on the cursor.
 # "multi"  - drag a box around any number of items; on release, that whole
 #            region is captured and scanned for every item inside it,
 #            labeling each one in place with its name and price.
-SELECTION_MODE = "single"  # "single" | "multi"
+# "grid"   - WFInfo-style. Calibrate a fixed R x C slot grid once, then the
+#            scan hotkey OCRs every slot's name band (with multi-frame
+#            voting) and labels each slot with its price.
+SELECTION_MODE = "single"  # "single" | "multi" | "grid"
+_VALID_SELECTION_MODES = ("single", "multi", "grid")
 SELECTION_MODE_FILE = CACHE_DIR / "selection_mode.json"
 
 
@@ -94,7 +144,7 @@ def load_selection_mode() -> None:
     try:
         data = json.loads(SELECTION_MODE_FILE.read_text(encoding="utf-8"))
         mode = data.get("mode")
-        if mode in ("single", "multi"):
+        if mode in _VALID_SELECTION_MODES:
             SELECTION_MODE = mode
     except (OSError, json.JSONDecodeError):
         pass
@@ -112,11 +162,46 @@ load_selection_mode()
 WFM_API_BASE = "https://api.warframe.market/v2"
 WFM_PLATFORM = "pc"
 HTTP_TIMEOUT_SECONDS = 15
-REQUEST_DELAY_SECONDS = 0.3  # be polite between uncached order lookups
+REQUEST_DELAY_SECONDS = 0.3  # be polite: each price-fetch worker waits this long per request
 
 # TTLs
 ITEMS_CACHE_TTL_SECONDS = 3 * 24 * 3600   # item catalog barely changes; 3 days
 PRICE_CACHE_TTL_SECONDS = 10 * 60         # prices move; 10 minutes
+
+# How many item prices to fetch from warframe.market at once. 1 = fully
+# sequential (the original, safest behavior - roughly matches their ~3 req/s
+# etiquette given REQUEST_DELAY_SECONDS). Higher overlaps network latency for
+# faster scans, but issues requests faster too: warframe.market may return
+# HTTP 429 / temporarily rate-limit your IP if you push it too high. Exposed
+# as a slider in the window; persisted here.
+PRICE_FETCH_WORKERS = 1
+PRICE_FETCH_WORKERS_MIN = 1
+PRICE_FETCH_WORKERS_MAX = 8
+PRICE_FETCH_FILE = CACHE_DIR / "price_fetch.json"
+
+
+def load_price_fetch_workers() -> None:
+    global PRICE_FETCH_WORKERS
+    if not PRICE_FETCH_FILE.exists():
+        return
+    try:
+        data = json.loads(PRICE_FETCH_FILE.read_text(encoding="utf-8"))
+        PRICE_FETCH_WORKERS = _clamp_workers(int(data["workers"]))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        pass
+
+
+def save_price_fetch_workers(workers: int) -> None:
+    global PRICE_FETCH_WORKERS
+    PRICE_FETCH_WORKERS = _clamp_workers(workers)
+    PRICE_FETCH_FILE.write_text(json.dumps({"workers": PRICE_FETCH_WORKERS}), encoding="utf-8")
+
+
+def _clamp_workers(n: int) -> int:
+    return max(PRICE_FETCH_WORKERS_MIN, min(PRICE_FETCH_WORKERS_MAX, n))
+
+
+load_price_fetch_workers()
 
 # --- OCR engine choice ------------------------------------------------------
 # "easyocr"       - local deep-learning OCR. Most accurate on messy/stylized
@@ -211,6 +296,28 @@ TESSERACT_CONFIG = "--oem 3 --psm 6"
 # separation. EasyOCR doesn't need this distinction - its detector already
 # treats spatially separate text as separate regions on its own.
 TESSERACT_SPARSE_CONFIG = "--oem 3 --psm 11"
+# Grid Scan mode montages each slot's name band into one stacked image and
+# reads it as a uniform block (one line per band). psm 6 fits the montage
+# (each band is one line, stacked in a single column).
+#
+# A restricted character whitelist (a WFInfo trick to cut false positives on
+# decorative backgrounds) is deliberately NOT applied here: passing
+# `tessedit_char_whitelist` inline through pytesseract breaks, because
+# pytesseract splits the config string with shlex and Warframe names need a
+# space in the whitelist (multi-word names) plus an apostrophe/ampersand,
+# which shlex mis-parses ("No closing quotation"). The downstream fuzzy match
+# against the fixed catalog + multi-frame voting already clean up the OCR
+# junk the whitelist would have suppressed, so the accuracy cost is minimal.
+TESSERACT_GRID_CONFIG = "--oem 3 --psm 6"
+
+# --- Name-band preprocessing (Grid Scan) --------------------------------
+# Grid Scan applies a stronger contrast + binarization step than the other
+# modes to isolate the bright name text from the animated card art. Otsu's
+# method picks a threshold automatically; GRID_BINARIZE_CUTOFF is a floor -
+# if Otsu picks something lower, this value is used instead, so faint
+# background gradients don't drag the threshold down into the artwork. Raise
+# it if backgrounds still bleed through, lower it if thin strokes vanish.
+GRID_BINARIZE_CUTOFF = 140  # 0-255
 
 # --- AI vision (Claude / Gemini) --------------------------------------------
 # Both providers' API keys resolve the same way: a gitignored data/cache/

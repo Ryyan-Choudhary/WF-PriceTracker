@@ -9,6 +9,7 @@ callback via root.after(0, ...).
 from __future__ import annotations
 
 import queue
+import threading
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable
@@ -37,14 +38,16 @@ class AppWindow:
         on_set_anthropic_key: Callable[[str], None],
         on_set_google_key: Callable[[str], None],
         on_selection_mode_change: Callable[[str], None],
+        on_calibrate_grid: Callable[[], None],
+        on_price_workers_change: Callable[[int], None],
         on_quit: Callable[[], None],
     ) -> None:
         self._log_queue: "queue.Queue[str]" = queue.Queue()
 
         self.root = tk.Tk()
         self.root.title("WF-PriceTracker")
-        self.root.geometry("460x500")
-        self.root.minsize(360, 360)
+        self.root.geometry("470x560")
+        self.root.minsize(380, 420)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.status_var = tk.StringVar(value="Idle")
@@ -52,6 +55,8 @@ class AppWindow:
         self.topmost_var = tk.BooleanVar(value=False)
         self.engine_var = tk.StringVar()
         self.selection_mode_var = tk.StringVar(value="single")
+        self.price_workers_var = tk.IntVar(value=1)
+        self.price_workers_label_var = tk.StringVar(value="")
         self._current_engine_key = "tesseract"
 
         self._on_toggle_scan = on_toggle_scan
@@ -62,6 +67,8 @@ class AppWindow:
         self._on_set_anthropic_key = on_set_anthropic_key
         self._on_set_google_key = on_set_google_key
         self._on_selection_mode_change = on_selection_mode_change
+        self._on_calibrate_grid = on_calibrate_grid
+        self._on_price_workers_change = on_price_workers_change
         self._on_quit = on_quit
 
         self._build_widgets()
@@ -69,8 +76,10 @@ class AppWindow:
 
         self._snip_overlay = SnipOverlay(self.root)
         self._calibrator: BoxSizeCalibrator | None = None
+        self._grid_calibrator: GridCalibrator | None = None
         self._cursor_box_overlay = CursorBoxOverlay(self.root)
         self._multi_result_overlay = MultiResultOverlay(self.root)
+        self._grid_outline_overlay = GridOutlineOverlay(self.root)
 
     def _build_widgets(self) -> None:
         pad = {"padx": 10, "pady": 6}
@@ -91,6 +100,10 @@ class AppWindow:
             mode_frame, text="Multi-Select", value="multi", variable=self.selection_mode_var,
             command=self._on_selection_mode_selected,
         ).pack(side="left", padx=(6, 0))
+        ttk.Radiobutton(
+            mode_frame, text="Grid Scan", value="grid", variable=self.selection_mode_var,
+            command=self._on_selection_mode_selected,
+        ).pack(side="left", padx=(6, 0))
 
         btn_frame = ttk.Frame(self.root)
         btn_frame.pack(fill="x", **pad)
@@ -107,6 +120,13 @@ class AppWindow:
         ttk.Button(setup_frame, text="Refresh Item List", command=self._on_refresh_catalog).pack(
             side="left", expand=True, fill="x", padx=(4, 0)
         )
+
+        grid_frame = ttk.Frame(self.root)
+        grid_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self.calibrate_grid_btn = ttk.Button(
+            grid_frame, text="Calibrate Grid... (for Grid Scan)", command=self._on_calibrate_grid
+        )
+        self.calibrate_grid_btn.pack(fill="x")
 
         engine_frame = ttk.Frame(self.root)
         engine_frame.pack(fill="x", **pad)
@@ -134,6 +154,23 @@ class AppWindow:
         )
         self.google_key_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
 
+        speed_frame = ttk.Frame(self.root)
+        speed_frame.pack(fill="x", padx=10, pady=(0, 2))
+        ttk.Label(speed_frame, textvariable=self.price_workers_label_var).pack(side="left")
+        self.price_workers_scale = ttk.Scale(
+            speed_frame,
+            from_=config.PRICE_FETCH_WORKERS_MIN,
+            to=config.PRICE_FETCH_WORKERS_MAX,
+            orient="horizontal",
+            command=self._on_price_workers_scale,
+        )
+        self.price_workers_scale.pack(side="left", expand=True, fill="x", padx=(6, 0))
+        ttk.Label(
+            self.root,
+            text="Higher = faster scans, but warframe.market may rate-limit your IP above ~3.",
+            foreground="gray", font=("Segoe UI", 8),
+        ).pack(fill="x", padx=10, pady=(0, 6))
+
         log_frame = ttk.Frame(self.root)
         log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
         self.log_box = tk.Listbox(log_frame, font=("Consolas", 9), activestyle="none")
@@ -156,12 +193,7 @@ class AppWindow:
 
     def _on_selection_mode_selected(self) -> None:
         mode = self.selection_mode_var.get()
-        if mode == "multi":
-            self.scan_now_btn.state(["disabled"])
-            self.hint_var.set("F10: toggle scan mode   drag to select & scan   Ctrl+F10: quit")
-        else:
-            self.scan_now_btn.state(["!disabled"])
-            self.hint_var.set("F10: toggle scan mode   F9: scan at cursor   Ctrl+F10: quit")
+        self._apply_mode_ui(mode)
         self._on_selection_mode_change(mode)
 
     def set_selection_mode_selection(self, mode: str) -> None:
@@ -171,17 +203,47 @@ class AppWindow:
 
         def _set() -> None:
             self.selection_mode_var.set(mode)
-            self._on_selection_mode_selected_ui_only(mode)
+            self._apply_mode_ui(mode)
 
         self.call_soon(_set)
 
-    def _on_selection_mode_selected_ui_only(self, mode: str) -> None:
+    def _apply_mode_ui(self, mode: str) -> None:
+        # F9 ("Scan Now") is meaningful in Single (scan at cursor) and Grid
+        # (scan the whole grid), but not in Multi (there you drag instead).
         if mode == "multi":
             self.scan_now_btn.state(["disabled"])
             self.hint_var.set("F10: toggle scan mode   drag to select & scan   Ctrl+F10: quit")
-        else:
+        elif mode == "grid":
+            self.scan_now_btn.state(["!disabled"])
+            self.hint_var.set("F10: toggle scan mode   F9: scan grid   Ctrl+F10: quit")
+        else:  # single
             self.scan_now_btn.state(["!disabled"])
             self.hint_var.set("F10: toggle scan mode   F9: scan at cursor   Ctrl+F10: quit")
+
+    def _on_price_workers_scale(self, raw: str) -> None:
+        # ttk.Scale is continuous; snap to an int and only fire the persist
+        # callback when the integer value actually changes (not on every
+        # sub-pixel of a drag).
+        value = int(round(float(raw)))
+        self._update_price_workers_label(value)
+        if value != self.price_workers_var.get():
+            self.price_workers_var.set(value)
+            self._on_price_workers_change(value)
+
+    def _update_price_workers_label(self, value: int) -> None:
+        note = " (safe)" if value == 1 else (" (polite)" if value <= 3 else " (may rate-limit)")
+        self.price_workers_label_var.set(f"Price threads: {value}{note}")
+
+    def set_price_workers(self, value: int) -> None:
+        """Reflects the persisted concurrency at startup without firing the
+        change callback. Thread-safe."""
+
+        def _set() -> None:
+            self.price_workers_var.set(value)
+            self.price_workers_scale.set(value)
+            self._update_price_workers_label(value)
+
+        self.call_soon(_set)
 
     def _on_engine_selected(self, _event: object = None) -> None:
         label = self.engine_var.get()
@@ -298,6 +360,94 @@ class AppWindow:
 
     def _clear_calibrator(self) -> None:
         self._calibrator = None
+
+    def start_grid_calibration(
+        self,
+        on_complete: Callable[[dict], None],
+        on_cancel: Callable[[], None],
+    ) -> None:
+        """Runs the two-drag grid calibration (box the first slot's name, then
+        the last slot's name), prompts for rows/cols, computes the grid dict,
+        and calls on_complete(grid). Must be called from the Tk thread.
+        """
+        if self._grid_calibrator is not None:
+            return
+        self._grid_calibrator = GridCalibrator(
+            self.root,
+            self._snip_overlay,
+            log=self.log,
+            on_finish=self._grid_calibration_finished,
+        )
+        self._grid_pending = (on_complete, on_cancel)
+        self._grid_calibrator.start()
+
+    def _grid_calibration_finished(self, rects: list[tuple[int, int, int, int]] | None) -> None:
+        on_complete, on_cancel = self._grid_pending
+        self._grid_calibrator = None
+        if rects is None:
+            on_cancel()
+            return
+        from tkinter import simpledialog
+
+        first, last = rects
+        rows = simpledialog.askinteger("Grid rows", "How many rows in the grid?", parent=self.root, minvalue=1, maxvalue=50)
+        if not rows:
+            on_cancel()
+            return
+        cols = simpledialog.askinteger("Grid columns", "How many columns in the grid?", parent=self.root, minvalue=1, maxvalue=50)
+        if not cols:
+            on_cancel()
+            return
+        grid = {
+            "first_x": first[0], "first_y": first[1],
+            "band_w": first[2], "band_h": first[3],
+            "col_pitch": (last[0] - first[0]) / max(cols - 1, 1),
+            "row_pitch": (last[1] - first[1]) / max(rows - 1, 1),
+            "rows": rows, "cols": cols,
+        }
+        on_complete(grid)
+
+    # --- grid outline preview (fixed rects shown while Grid Scan mode is on)
+    def show_grid_outline(self, rects: list[tuple[int, int, int, int]]) -> None:
+        self.call_soon(lambda: self._grid_outline_overlay.show(rects))
+
+    def hide_grid_outline(self) -> None:
+        self.call_soon(lambda: self._grid_outline_overlay.hide())
+
+    # --- hide ourselves during a screen grab -----------------------------
+    # Our result labels, grid outline, cursor box and even the main window
+    # sit on top of the game; if they overlap the scanned area they get
+    # captured and OCR'd as garbage (worst of all, result labels drawn over
+    # item names corrupt the very names on a re-scan). So the scan worker
+    # calls capture_hidden(...) which withdraws everything for the duration
+    # of the grab, then restores. Global hotkeys keep working meanwhile.
+    def capture_hidden(self, capture_fn: Callable[[], object]) -> object:
+        """Run capture_fn (a screen grab, on the CALLER's thread) with all our
+        windows hidden. Marshals the hide/restore onto the Tk thread and
+        blocks the caller until the hide has actually rendered."""
+        hidden = threading.Event()
+        self.call_soon(lambda: (self._hide_for_capture(), hidden.set()))
+        hidden.wait(timeout=1.5)
+        try:
+            return capture_fn()
+        finally:
+            self.call_soon(self._restore_after_capture)
+
+    def _hide_for_capture(self) -> None:
+        self._was_main_visible = bool(self.root.winfo_viewable())
+        for overlay in (
+            self._snip_overlay, self._cursor_box_overlay,
+            self._multi_result_overlay, self._grid_outline_overlay,
+        ):
+            overlay.withdraw()
+        self.root.withdraw()
+        self.root.update_idletasks()  # force the un-map to take effect before the grab
+
+    def _restore_after_capture(self) -> None:
+        if getattr(self, "_was_main_visible", True):
+            self.root.deiconify()
+        # Overlays are re-shown by their owners: grid outline via main after
+        # a grid scan, result labels as on_match fires. Nothing to restore here.
 
     # --- cursor-following box outline shown while scan mode is on --------
     def show_cursor_box(self, box_w: int, box_h: int, x: int, y: int) -> None:
@@ -620,6 +770,125 @@ class BoxSizeCalibrator:
     def _on_move(self, x: int, y: int) -> None:
         if self._start is not None:
             self._root.after(0, lambda: self._overlay.update_to(x, y))
+
+
+class GridCalibrator:
+    """Two sequential one-shot drags for Grid Scan calibration: box the FIRST
+    (top-left) slot's name text, then the LAST (bottom-right) slot's name
+    text. Reports both full rects (x, y, w, h in screen coords). A single
+    persistent listener handles both drags; it stops itself after the second.
+    Calls on_finish([first_rect, last_rect]) on success, or on_finish(None)
+    if either drag is too small (treated as cancel).
+    """
+
+    MIN_DRAG_PX = 8
+
+    def __init__(
+        self,
+        root: tk.Misc,
+        overlay: SnipOverlay,
+        log: Callable[[str], None],
+        on_finish: Callable[[list | None], None],
+    ) -> None:
+        self._root = root
+        self._overlay = overlay
+        self._log = log
+        self._on_finish = on_finish
+        self._start: tuple[int, int] | None = None
+        self._rects: list[tuple[int, int, int, int]] = []
+        self._listener: mouse.Listener | None = None
+
+    def start(self) -> None:
+        self._log("Grid calibration: drag a box around the FIRST (top-left) item's name text.")
+        self._listener = mouse.Listener(on_click=self._on_click, on_move=self._on_move)
+        self._listener.start()
+
+    def _stop_listener(self) -> None:
+        if self._listener is not None:
+            self._listener.stop()
+            self._listener = None
+
+    def _on_click(self, x: int, y: int, button: mouse.Button, pressed: bool) -> None:
+        if button != mouse.Button.left:
+            return
+        if pressed:
+            self._start = (x, y)
+            self._root.after(0, lambda: self._overlay.begin(x, y))
+            return
+
+        start = self._start
+        self._start = None
+        self._root.after(0, self._overlay.end)
+        if start is None:
+            return
+        x0, y0 = start
+        w, h = abs(x - x0), abs(y - y0)
+        if w < self.MIN_DRAG_PX or h < self.MIN_DRAG_PX:
+            self._stop_listener()
+            self._root.after(0, lambda: self._on_finish(None))
+            return
+
+        rect = (min(x0, x), min(y0, y), w, h)
+        self._rects.append(rect)
+        if len(self._rects) == 1:
+            self._log("Now drag a box around the LAST (bottom-right) item's name text.")
+        else:
+            self._stop_listener()
+            rects = self._rects
+            self._root.after(0, lambda: self._on_finish(rects))
+
+    def _on_move(self, x: int, y: int) -> None:
+        if self._start is not None:
+            self._root.after(0, lambda: self._overlay.update_to(x, y))
+
+
+class GridOutlineOverlay(tk.Toplevel):
+    """Draws a set of fixed rectangles (the calibrated grid's slot name bands)
+    over the screen so the user can confirm the grid lines up before scanning.
+    Shown while Grid Scan mode + scan mode are both on; purely a preview.
+    """
+
+    _TRANSPARENT_KEY = "#010203"
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-transparentcolor", self._TRANSPARENT_KEY)
+        except tk.TclError:
+            self.attributes("-alpha", 0.25)
+
+        self._offset = (0, 0)
+        self.canvas = tk.Canvas(self, bg=self._TRANSPARENT_KEY, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self._rect_ids: list[int] = []
+
+    def _refresh_geometry(self) -> None:
+        left, top, width, height = virtual_screen_rect()
+        self.geometry(f"{width}x{height}+{left}+{top}")
+        self._offset = (left, top)
+
+    def show(self, rects: list[tuple[int, int, int, int]]) -> None:
+        self._refresh_geometry()
+        for rid in self._rect_ids:
+            self.canvas.delete(rid)
+        self._rect_ids.clear()
+        ox, oy = self._offset
+        for (x, y, w, h) in rects:
+            rid = self.canvas.create_rectangle(
+                x - ox, y - oy, x - ox + w, y - oy + h, outline="#4ddbea", width=1
+            )
+            self._rect_ids.append(rid)
+        self.deiconify()
+        self.lift()
+
+    def hide(self) -> None:
+        for rid in self._rect_ids:
+            self.canvas.delete(rid)
+        self._rect_ids.clear()
+        self.withdraw()
 
 
 class ResultPopup(tk.Toplevel):

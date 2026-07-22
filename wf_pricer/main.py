@@ -124,6 +124,8 @@ class App:
             self.window.set_toggle_label("Stop Scan Mode (F10)")
             if self.selection_mode == "multi":
                 self.window.log("--- Scan mode ON: drag a box around any items to scan them ---")
+            elif self.selection_mode == "grid":
+                self.window.log("--- Scan mode ON: open your inventory, press F9 to scan the grid ---")
             else:
                 self.window.log("--- Scan mode ON: hover an item, press F9 ---")
         else:
@@ -134,11 +136,18 @@ class App:
     def on_scan(self) -> None:
         if self.selection_mode == "multi":
             if self.window:
-                self.window.log("F9 is for Single Item mode - Multi-Select scans on click-drag instead.")
+                self.window.log("F9 is for Single Item / Grid mode - Multi-Select scans on click-drag instead.")
             return
         if not self.scan_active:
             if self.window:
                 self.window.log("Not scanning - press F10 (or Start Scan Mode) first.")
+            return
+        if self.selection_mode == "grid":
+            if config.GRID is None:
+                if self.window:
+                    self.window.log('Calibrate the grid first ("Calibrate Grid..." button).')
+                return
+            threading.Thread(target=self._grid_scan_worker, daemon=True).start()
             return
         if config.BOX_WIDTH_PX is None or config.BOX_HEIGHT_PX is None:
             if self.window:
@@ -146,6 +155,8 @@ class App:
             return
         cx, cy = scan.get_cursor_position()
         threading.Thread(target=self._scan_worker, args=(cx, cy), daemon=True).start()
+
+    _MODE_NAMES = {"single": "Single Item", "multi": "Multi-Select", "grid": "Grid Scan"}
 
     def set_selection_mode(self, mode: str) -> None:
         if mode == self.selection_mode:
@@ -156,9 +167,27 @@ class App:
         config.save_selection_mode(mode)
         self.selection_mode = mode
         if self.window:
-            self.window.log(f"Selection mode set to: {'Multi-Select' if mode == 'multi' else 'Single Item'}")
+            self.window.log(f"Selection mode set to: {self._MODE_NAMES.get(mode, mode)}")
         if was_active:
             self._start_mode_listener()
+
+    def calibrate_grid(self) -> None:
+        if self.window is None:
+            return
+        self.window.start_grid_calibration(
+            on_complete=self._on_grid_calibrated,
+            on_cancel=lambda: self.window.log("Grid calibration cancelled."),
+        )
+
+    def _on_grid_calibrated(self, grid: dict) -> None:
+        config.save_grid_calibration(grid)
+        if self.window:
+            self.window.log(
+                f"Grid calibrated: {grid['rows']}x{grid['cols']} slots, "
+                f"band {grid['band_w']}x{grid['band_h']}px."
+            )
+            if self.scan_active and self.selection_mode == "grid":
+                self.window.show_grid_outline(pipeline.grid_slot_rects(grid))
 
     _ENGINE_NAMES = {
         "easyocr": "EasyOCR (accurate, slower)",
@@ -181,6 +210,11 @@ class App:
         config.save_google_api_key(key)
         if self.window:
             self.window.log("Google API key saved (data/cache/google_api_key.json, gitignored).")
+
+    def set_price_workers(self, workers: int) -> None:
+        config.save_price_fetch_workers(workers)
+        if self.window:
+            self.window.log(f"Price fetch concurrency set to {config.PRICE_FETCH_WORKERS} thread(s).")
 
     def set_box_size(self) -> None:
         if self.window is None:
@@ -223,12 +257,19 @@ class App:
     def _start_mode_listener(self) -> None:
         if self.selection_mode == "multi":
             self._start_drag_select()
+        elif self.selection_mode == "grid":
+            # Grid mode is triggered by F9 (already globally bound); just show
+            # the calibrated grid outline so the user can confirm alignment.
+            if self.window and config.GRID is not None:
+                self.window.show_grid_outline(pipeline.grid_slot_rects(config.GRID))
         else:
             self._start_cursor_box()
 
     def _stop_mode_listener(self) -> None:
         self._stop_cursor_box()
         self._stop_drag_select()
+        if self.window:
+            self.window.hide_grid_outline()
 
     def _start_cursor_box(self) -> None:
         if config.BOX_WIDTH_PX is None or config.BOX_HEIGHT_PX is None:
@@ -281,9 +322,17 @@ class App:
             target=self._multi_scan_worker, args=(left, top, right, bottom), daemon=True
         ).start()
 
+    def _capture(self, capture_fn):
+        """Run a screen grab with our own windows/overlays hidden, so we never
+        OCR our result labels, grid outline, or app window on top of the game.
+        """
+        if self.window is None:
+            return capture_fn()
+        return self.window.capture_hidden(capture_fn)
+
     def _scan_worker(self, cx: int, cy: int) -> None:
         try:
-            crop = scan.grab_box_at(cx, cy, config.BOX_WIDTH_PX, config.BOX_HEIGHT_PX)
+            crop = self._capture(lambda: scan.grab_box_at(cx, cy, config.BOX_WIDTH_PX, config.BOX_HEIGHT_PX))
         except Exception:
             log.exception("Scan screen capture failed")
             return
@@ -331,7 +380,7 @@ class App:
             return
 
         try:
-            region = scan.grab_region(left, top, right, bottom)
+            region = self._capture(lambda: scan.grab_region(left, top, right, bottom))
         except Exception:
             log.exception("Multi-select screen capture failed")
             return
@@ -371,6 +420,75 @@ class App:
             else:
                 self.window.log(f"--- Done: {found} item(s) found in region ---")
 
+    def _grid_scan_worker(self) -> None:
+        grid = config.GRID
+        if grid is None:
+            return
+        if self.items_index is None:
+            if self.window:
+                self.window.log("Still loading item catalog - try again in a moment.")
+            return
+
+        # Bounding rect over all slot name bands = the region to capture.
+        rects = pipeline.grid_slot_rects(grid)
+        left = min(x for x, y, w, h in rects)
+        top = min(y for x, y, w, h in rects)
+        right = max(x + w for x, y, w, h in rects)
+        bottom = max(y + h for x, y, w, h in rects)
+
+        if self.window:
+            self.window.clear_multi_results()
+            self.window.log(
+                f"--- Grid scan: {grid['rows']}x{grid['cols']} slots, "
+                f"{config.GRID_SCAN_FRAMES} frame(s)... ---"
+            )
+
+        try:
+            frames = self._capture(lambda: scan.capture_frames(
+                left, top, right, bottom, config.GRID_SCAN_FRAMES, config.GRID_SCAN_FRAME_DELAY_S
+            ))
+        except Exception:
+            log.exception("Grid scan capture failed")
+            return
+        finally:
+            # capture_hidden withdrew the grid outline; bring it back for the
+            # next scan while scan mode stays on.
+            if self.window and self.scan_active and self.selection_mode == "grid":
+                self.window.show_grid_outline(rects)
+
+        found = 0
+
+        def on_match(match: pipeline.RegionMatch) -> None:
+            nonlocal found
+            found += 1
+            self.scan_count += 1
+            approx = "~" if match.price.used_fallback else ""
+            price_line = (
+                f"{approx}{match.price.avg_platinum:g}p avg "
+                f"(lowest {match.price.lowest_platinum}p, n={match.price.sample_size})"
+            )
+            if self.window:
+                screen_x = left + match.bbox[0]
+                screen_y = top + match.bbox[1]
+                self.window.add_multi_result_label(screen_x, screen_y, match.name, price_line)
+                self.window.log(f"[{self.scan_count}] {match.name}: {price_line}")
+            self._append_scan_log(match.name, price_line, "(grid)")
+
+        try:
+            pipeline.price_grid(frames, grid, (left, top), self.items_index, on_match=on_match)
+        except Exception:
+            log.exception("Grid scan OCR/pricing failed")
+            if self.window:
+                self.window.log("Grid scan failed - check data/logs/app.log")
+            return
+
+        if self.window:
+            total = grid["rows"] * grid["cols"]
+            if found == 0:
+                self.window.log("No items recognized - check grid calibration / open the inventory first.")
+            else:
+                self.window.log(f"--- Done: {found}/{total} slots identified ---")
+
     def _append_scan_log(self, name: str, price_line: str, raw_display: str) -> None:
         timestamp = datetime.datetime.now().isoformat(timespec="seconds")
         try:
@@ -406,11 +524,14 @@ def main() -> None:
         on_set_anthropic_key=app.set_anthropic_key,
         on_set_google_key=app.set_google_key,
         on_selection_mode_change=app.set_selection_mode,
+        on_calibrate_grid=app.calibrate_grid,
+        on_price_workers_change=app.set_price_workers,
         on_quit=app.on_quit,
     )
     app.window = window
     window.set_engine_selection(config.OCR_ENGINE)
     window.set_selection_mode_selection(config.SELECTION_MODE)
+    window.set_price_workers(config.PRICE_FETCH_WORKERS)
 
     if config.BOX_WIDTH_PX is not None and config.BOX_HEIGHT_PX is not None:
         window.set_box_size_label(f"Box size: {config.BOX_WIDTH_PX}x{config.BOX_HEIGHT_PX}px")

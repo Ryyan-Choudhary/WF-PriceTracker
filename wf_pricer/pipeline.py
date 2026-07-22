@@ -6,16 +6,20 @@ price it.
 
 price_region() is for multi-select scans: OCR a larger region that may
 contain several different items' tiles, and price every one found.
+
+price_grid() is for Grid Scan mode: a calibrated R x C grid of slots, each
+slot's name band OCR'd and voted across several captured frames.
 """
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from PIL import Image
 
-from . import market, ocr
+from . import config, market, ocr
 from .items_db import ItemsIndex
 
 log = logging.getLogger(__name__)
@@ -93,15 +97,16 @@ def price_region(
     Warframe's habit of wrapping a long name across 2 lines within one tile
     without merging two different tiles' names together.
 
-    Calls on_match(match) as each item is found and priced, so a caller can
-    update a live on-screen overlay incrementally rather than waiting for
-    the whole (possibly slow - one live price lookup per item) region to
-    finish.
+    Prices are fetched concurrently (see market.get_prices) since that's the
+    slow part; on_match(match) fires as each item's price resolves, so a
+    caller can update a live on-screen overlay incrementally.
     """
     lines = ocr.extract_lines(image, sparse=True)
-    matches: list[RegionMatch] = []
     skip_indices: set[int] = set()
 
+    # First pass: OCR match every item and remember its (item, bbox), WITHOUT
+    # pricing yet, so all the network lookups can be batched concurrently.
+    identified: list[tuple[object, tuple[int, int, int, int]]] = []
     for i, line in enumerate(lines):
         if i in skip_indices:
             continue
@@ -137,10 +142,6 @@ def price_region(
         if matched_item is None:
             continue
 
-        price = market.get_price(matched_item.slug)
-        if not price.has_data:
-            continue
-
         bbox = line.bbox
         if used_combo:
             partner = lines[partner_idx]
@@ -151,9 +152,136 @@ def price_region(
             y1 = max(line.bbox[1] + line.bbox[3], partner.bbox[1] + partner.bbox[3])
             bbox = (x0, y0, x1 - x0, y1 - y0)
 
-        match = RegionMatch(name=matched_item.name, slug=matched_item.slug, price=price, bbox=bbox)
-        matches.append(match)
-        if on_match:
-            on_match(match)
+        identified.append((matched_item, bbox))
 
+    return _price_and_emit(identified, on_match)
+
+
+def _price_and_emit(
+    identified: list[tuple[object, tuple[int, int, int, int]]],
+    on_match: Optional[Callable[[RegionMatch], None]],
+) -> list[RegionMatch]:
+    """Shared tail of price_region/price_grid: batch-fetch prices for all the
+    identified items concurrently, emitting a RegionMatch (skipping items with
+    no live sell orders) via on_match as each item's price resolves, so the
+    overlay still fills in incrementally rather than all at once.
+    """
+    slots_by_slug: dict[str, list[tuple[object, tuple[int, int, int, int]]]] = {}
+    for item, bbox in identified:
+        slots_by_slug.setdefault(item.slug, []).append((item, bbox))
+
+    matches: list[RegionMatch] = []
+
+    def on_priced(slug: str, price: market.PriceEstimate) -> None:
+        if not price.has_data:
+            return
+        for item, bbox in slots_by_slug.get(slug, []):
+            match = RegionMatch(name=item.name, slug=item.slug, price=price, bbox=bbox)
+            matches.append(match)
+            if on_match:
+                on_match(match)
+
+    # get_prices calls on_priced from THIS thread (its as_completed loop), not
+    # the worker threads, so appending to `matches` here needs no extra lock.
+    market.get_prices([item.slug for item, _bbox in identified], on_result=on_priced)
     return matches
+
+
+def grid_slot_rects(grid: dict) -> list[tuple[int, int, int, int]]:
+    """Expand a grid calibration into per-slot name-band rects in SCREEN
+    coordinates, row-major (top-left to bottom-right).
+    """
+    rects: list[tuple[int, int, int, int]] = []
+    for r in range(grid["rows"]):
+        for c in range(grid["cols"]):
+            x = int(round(grid["first_x"] + c * grid["col_pitch"]))
+            y = int(round(grid["first_y"] + r * grid["row_pitch"]))
+            rects.append((x, y, int(grid["band_w"]), int(grid["band_h"])))
+    return rects
+
+
+def price_grid(
+    frames: list[Image.Image],
+    grid: dict,
+    region_origin: tuple[int, int],
+    items_index: ItemsIndex,
+    on_match: Optional[Callable[[RegionMatch], None]] = None,
+) -> list[RegionMatch]:
+    """Prices every slot of a calibrated grid.
+
+    `frames` are captures of the grid's bounding region (all region-local,
+    top-left at 0,0); `region_origin` is that region's screen position, so
+    each slot's screen rect maps to a frame crop. Each slot's name band is
+    OCR'd in every frame (see ocr.read_name_bands) and the matched item is
+    VOTED across frames - Warframe's animated card backgrounds make the same
+    slot read slightly differently frame to frame, so voting beats
+    background-induced errors. A slot is skipped if the vote is tied between
+    two different items (ambiguous - don't guess), mirroring the fuzzy
+    matcher's own "refuse close calls" rule.
+
+    Returns one RegionMatch per confidently-identified slot, with a
+    region-local bbox (caller adds region_origin to place it on screen, same
+    as price_region).
+    """
+    ox, oy = region_origin
+    slot_screen_rects = grid_slot_rects(grid)
+    n_slots = len(slot_screen_rects)
+
+    def crop_bands(frame: Image.Image) -> list[Image.Image]:
+        fw, fh = frame.size
+        bands = []
+        for (sx, sy, w, h) in slot_screen_rects:
+            lx, ly = sx - ox, sy - oy
+            box = (max(0, lx), max(0, ly), min(fw, lx + w), min(fh, ly + h))
+            bands.append(frame.crop(box))
+        return bands
+
+    # OCR every frame's slot bands -> per-frame list of texts. The frames are
+    # independent, so OCR them concurrently when the engine allows it (see
+    # _read_frames_texts). This is CPU/latency-bound, not rate-limited.
+    frame_texts = _read_frames_texts([crop_bands(f) for f in frames])
+
+    votes: list[list[str]] = [[] for _ in range(n_slots)]
+    slug_to_item = {}
+    for texts in frame_texts:
+        for i, text in enumerate(texts):
+            if not text:
+                continue
+            item = items_index.match(text)
+            if item is not None:
+                votes[i].append(item.slug)
+                slug_to_item[item.slug] = item
+
+    # Resolve each slot's winning item by vote (skip ties), then batch-price.
+    identified: list[tuple[object, tuple[int, int, int, int]]] = []
+    for i, slugs in enumerate(votes):
+        if not slugs:
+            continue
+        counts = Counter(slugs).most_common()
+        if len(counts) > 1 and counts[0][1] == counts[1][1]:
+            log.info("Grid slot %d: tied vote %s - refusing to guess", i, counts[:2])
+            continue  # ambiguous - two items tied
+        winner_slug = counts[0][0]
+        item = slug_to_item[winner_slug]
+        sx, sy, w, h = slot_screen_rects[i]
+        identified.append((item, (sx - ox, sy - oy, w, h)))
+
+    return _price_and_emit(identified, on_match)
+
+
+def _read_frames_texts(per_frame_bands: list[list[Image.Image]]) -> list[list[str]]:
+    """OCR each frame's slot bands, returning one text-list per frame.
+
+    Runs the frames concurrently for Tesseract (each ocr call spawns its own
+    tesseract.exe subprocess, which releases the GIL - safe and a real
+    speedup). EasyOCR shares one PyTorch model that is NOT safe to call from
+    multiple threads at once, and the vision engines cost money per call, so
+    those stay sequential.
+    """
+    if len(per_frame_bands) <= 1 or config.OCR_ENGINE != "tesseract":
+        return [ocr.read_name_bands(bands) for bands in per_frame_bands]
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=len(per_frame_bands), thread_name_prefix="wf-ocr") as pool:
+        return list(pool.map(ocr.read_name_bands, per_frame_bands))
