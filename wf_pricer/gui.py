@@ -8,6 +8,7 @@ callback via root.after(0, ...).
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import tkinter as tk
@@ -18,6 +19,8 @@ from pynput import mouse
 
 from . import config
 from .scan import virtual_screen_rect
+
+log = logging.getLogger(__name__)
 
 
 class AppWindow:
@@ -426,8 +429,23 @@ class AppWindow:
         windows hidden. Marshals the hide/restore onto the Tk thread and
         blocks the caller until the hide has actually rendered."""
         hidden = threading.Event()
-        self.call_soon(lambda: (self._hide_for_capture(), hidden.set()))
-        hidden.wait(timeout=1.5)
+
+        def hide() -> None:
+            # try/finally: if hiding ever raises we must STILL release the
+            # waiter, otherwise the grab stalls for the full timeout and then
+            # runs with our windows visible - which is exactly how our own
+            # UI text ends up being OCR'd as items.
+            try:
+                self._hide_for_capture()
+            finally:
+                hidden.set()
+
+        self.call_soon(hide)
+        if not hidden.wait(timeout=1.5):
+            log.warning(
+                "Timed out waiting to hide windows before a screen grab - the capture may "
+                "include this app's own window/labels."
+            )
         try:
             return capture_fn()
         finally:
@@ -439,7 +457,10 @@ class AppWindow:
             self._snip_overlay, self._cursor_box_overlay,
             self._multi_result_overlay, self._grid_outline_overlay,
         ):
-            overlay.withdraw()
+            try:
+                overlay.withdraw()
+            except tk.TclError:
+                pass
         self.root.withdraw()
         self.root.update_idletasks()  # force the un-map to take effect before the grab
 

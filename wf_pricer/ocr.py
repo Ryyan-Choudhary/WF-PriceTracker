@@ -243,24 +243,58 @@ _ENGINES = {
 _BAND_MARGIN = 8  # blank rows between stacked bands in the montage
 
 
-def _preprocess_name_band(image: Image.Image) -> Image.Image:
-    """Contrast-boost + binarize a single slot's name band to isolate the
+# Preprocessing variants tried, in order, when reading a slot's name band.
+# Profile 0 is the normal path; the rest are retries for slots the first pass
+# couldn't resolve. They deliberately pull in different directions - no
+# binarization (keeps anti-aliased strokes that thresholding can eat), no
+# upscaling (helps when interpolation smears an already-crisp label), and
+# stricter/looser thresholds (for backgrounds that bleed through, or thin
+# glyphs that vanish) - so a band that one variant mangles, another often
+# reads cleanly.
+# Ordered by how often they rescue a slot, since the retry loop stops at the
+# first profile that resolves it.
+NAME_BAND_PROFILES = [
+    {"label": "default",       "upscale": None, "binarize": True,  "cutoff_delta": 0},
+    {"label": "dim-text",      "upscale": None, "binarize": True,  "cutoff_delta": -55},
+    {"label": "no-binarize",   "upscale": None, "binarize": False, "cutoff_delta": 0},
+    {"label": "very-dim-text", "upscale": None, "binarize": True,  "cutoff_delta": -90},
+    {"label": "high-contrast", "upscale": None, "binarize": True,  "cutoff_delta": 40},
+    {"label": "no-upscale",    "upscale": 1.0,  "binarize": True,  "cutoff_delta": -55},
+    {"label": "big-upscale",   "upscale": 3.0,  "binarize": False, "cutoff_delta": 0},
+]
+
+
+def _preprocess_name_band(image: Image.Image, profile: int = 0) -> Image.Image:
+    """Contrast-boost (and usually binarize) a slot's name band to isolate the
     bright name text from the animated background art. Goes further than
-    _preprocess_for_tesseract (which the Single/Multi paths still use): after
-    grayscale + upscale + contrast stretch, it thresholds to near
-    black-and-white so the busy background collapses to one flat value and
-    only the bright glyphs survive. Returns dark-text-on-light (what
-    Tesseract prefers).
+    _preprocess_for_tesseract (which the Single/Multi paths still use).
+
+    `profile` indexes NAME_BAND_PROFILES - retries use a different variant so
+    a band that thresholds badly under one setting can still be read.
     """
+    prof = NAME_BAND_PROFILES[profile % len(NAME_BAND_PROFILES)]
+
     gray = image.convert("L")
-    factor = config.TESSERACT_UPSCALE_FACTOR
+    factor = prof["upscale"] if prof["upscale"] is not None else config.TESSERACT_UPSCALE_FACTOR
     if factor != 1.0:
         w, h = gray.size
         gray = gray.resize((max(1, int(w * factor)), max(1, int(h * factor))), Image.LANCZOS)
     gray = ImageOps.autocontrast(gray, cutoff=2)
 
+    if not prof["binarize"]:
+        # Keep the greyscale ramp; just make sure it's dark-text-on-light.
+        if ImageStat.Stat(gray).mean[0] < 128:
+            gray = ImageOps.invert(gray)
+        return gray
+
     arr = np.asarray(gray, dtype=np.uint8)
-    threshold = max(_otsu_threshold(arr), config.GRID_BINARIZE_CUTOFF)
+    # Otsu picks the split automatically; GRID_BINARIZE_CUTOFF is a floor so a
+    # flat, textless band doesn't get a meaninglessly low threshold. The
+    # profile's delta is applied AFTER that floor, so a "low-contrast" retry
+    # can genuinely go below Otsu's pick - which is what rescues dim text that
+    # a bright badge in the same band would otherwise push out of range.
+    threshold = max(_otsu_threshold(arr), config.GRID_BINARIZE_CUTOFF) + prof["cutoff_delta"]
+    threshold = max(1, min(255, threshold))
     # The name text is the BRIGHT part; keep pixels above the threshold as
     # text. Produce dark text on a light background for Tesseract.
     binary = np.where(arr >= threshold, 0, 255).astype(np.uint8)
@@ -296,10 +330,11 @@ def _otsu_threshold(arr: np.ndarray) -> int:
     return best_t
 
 
-def read_name_bands(bands: list[Image.Image]) -> list[str]:
+def read_name_bands(bands: list[Image.Image], profile: int = 0) -> list[str]:
     """Reads a list of pre-cropped slot name bands, returning one text string
     per band (in input order, "" for a band with no legible text). Preprocesses
-    each band with _preprocess_name_band first.
+    each band with _preprocess_name_band using the given `profile` (see
+    NAME_BAND_PROFILES - retries pass a different one).
 
     For Tesseract this stacks the bands into ONE tall montage and OCRs it in a
     single call (pytesseract spawns tesseract.exe per call, so per-band OCR of
@@ -311,7 +346,7 @@ def read_name_bands(bands: list[Image.Image]) -> list[str]:
     """
     if not bands:
         return []
-    processed = [_preprocess_name_band(b) for b in bands]
+    processed = [_preprocess_name_band(b, profile) for b in bands]
 
     engine = config.OCR_ENGINE
     if engine == "tesseract":

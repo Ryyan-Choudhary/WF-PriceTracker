@@ -206,6 +206,7 @@ def price_grid(
     region_origin: tuple[int, int],
     items_index: ItemsIndex,
     on_match: Optional[Callable[[RegionMatch], None]] = None,
+    on_unreadable: Optional[Callable[[tuple[int, int, int, int], str], None]] = None,
 ) -> list[RegionMatch]:
     """Prices every slot of a calibrated grid.
 
@@ -219,6 +220,13 @@ def price_grid(
     two different items (ambiguous - don't guess), mirroring the fuzzy
     matcher's own "refuse close calls" rule.
 
+    Slots that stay unresolved are RETRIED with alternative preprocessing
+    profiles (see ocr.NAME_BAND_PROFILES) against the same captured frames,
+    since a band one threshold mangles another often reads fine. Anything
+    still unresolved after every profile - but which did show some text - is
+    reported via on_unreadable(bbox, best_text) so the caller can mark it,
+    rather than leaving it silently blank like a genuinely empty slot.
+
     Returns one RegionMatch per confidently-identified slot, with a
     region-local bbox (caller adds region_origin to place it on screen, same
     as price_region).
@@ -227,50 +235,82 @@ def price_grid(
     slot_screen_rects = grid_slot_rects(grid)
     n_slots = len(slot_screen_rects)
 
-    def crop_bands(frame: Image.Image) -> list[Image.Image]:
+    def crop_bands(frame: Image.Image, slots: list[int]) -> list[Image.Image]:
         fw, fh = frame.size
         bands = []
-        for (sx, sy, w, h) in slot_screen_rects:
+        for i in slots:
+            sx, sy, w, h = slot_screen_rects[i]
             lx, ly = sx - ox, sy - oy
             box = (max(0, lx), max(0, ly), min(fw, lx + w), min(fh, ly + h))
             bands.append(frame.crop(box))
         return bands
 
-    # OCR every frame's slot bands -> per-frame list of texts. The frames are
-    # independent, so OCR them concurrently when the engine allows it (see
-    # _read_frames_texts). This is CPU/latency-bound, not rate-limited.
-    frame_texts = _read_frames_texts([crop_bands(f) for f in frames])
-
     votes: list[list[str]] = [[] for _ in range(n_slots)]
-    slug_to_item = {}
-    for texts in frame_texts:
-        for i, text in enumerate(texts):
-            if not text:
-                continue
-            item = items_index.match(text)
-            if item is not None:
-                votes[i].append(item.slug)
-                slug_to_item[item.slug] = item
+    saw_text: list[bool] = [False] * n_slots
+    last_text: list[str] = [""] * n_slots
+    slug_to_item: dict[str, object] = {}
 
-    # Resolve each slot's winning item by vote (skip ties), then batch-price.
-    identified: list[tuple[object, tuple[int, int, int, int]]] = []
-    for i, slugs in enumerate(votes):
-        if not slugs:
-            continue
-        counts = Counter(slugs).most_common()
+    def resolve(i: int) -> Optional[object]:
+        """Winning item for slot i, or None if no votes / a tie."""
+        if not votes[i]:
+            return None
+        counts = Counter(votes[i]).most_common()
         if len(counts) > 1 and counts[0][1] == counts[1][1]:
-            log.info("Grid slot %d: tied vote %s - refusing to guess", i, counts[:2])
-            continue  # ambiguous - two items tied
-        winner_slug = counts[0][0]
-        item = slug_to_item[winner_slug]
+            return None
+        return slug_to_item[counts[0][0]]
+
+    pending = list(range(n_slots))
+    max_profiles = 1 + max(0, config.GRID_SCAN_MAX_RETRY_PROFILES)
+    profiles = min(max_profiles, len(ocr.NAME_BAND_PROFILES))
+
+    # Pass 0 reads every slot with the normal preprocessing. Each later pass
+    # re-reads ONLY the slots still unresolved, using a different
+    # preprocessing profile (no binarize / no upscale / harder or softer
+    # contrast). The captured frames are reused, so a retry costs OCR time
+    # but no extra screen grab.
+    for profile in range(profiles):
+        if not pending:
+            break
+        if profile:
+            log.info(
+                "Grid: retrying %d unresolved slot(s) with profile %r",
+                len(pending), ocr.NAME_BAND_PROFILES[profile]["label"],
+            )
+        frame_texts = _read_frames_texts([crop_bands(f, pending) for f in frames], profile)
+        for texts in frame_texts:
+            for pos, text in enumerate(texts):
+                slot = pending[pos]
+                if not text:
+                    continue
+                saw_text[slot] = True
+                last_text[slot] = text
+                item = items_index.match(text)
+                if item is not None:
+                    votes[slot].append(item.slug)
+                    slug_to_item[item.slug] = item
+        pending = [i for i in pending if resolve(i) is None]
+
+    identified: list[tuple[object, tuple[int, int, int, int]]] = []
+    for i in range(n_slots):
+        item = resolve(i)
         sx, sy, w, h = slot_screen_rects[i]
-        identified.append((item, (sx - ox, sy - oy, w, h)))
+        bbox = (sx - ox, sy - oy, w, h)
+        if item is not None:
+            identified.append((item, bbox))
+        elif saw_text[i]:
+            # Text was visible but never resolved after every profile - tell
+            # the caller so it can flag the slot instead of leaving it blank
+            # (a blank slot is indistinguishable from an empty inventory slot).
+            log.info("Grid slot %d UNREADABLE after %d profile(s); best OCR: %r", i, profiles, last_text[i])
+            if on_unreadable:
+                on_unreadable(bbox, last_text[i])
 
     return _price_and_emit(identified, on_match)
 
 
-def _read_frames_texts(per_frame_bands: list[list[Image.Image]]) -> list[list[str]]:
-    """OCR each frame's slot bands, returning one text-list per frame.
+def _read_frames_texts(per_frame_bands: list[list[Image.Image]], profile: int = 0) -> list[list[str]]:
+    """OCR each frame's slot bands with the given preprocessing profile,
+    returning one text-list per frame.
 
     Runs the frames concurrently for Tesseract (each ocr call spawns its own
     tesseract.exe subprocess, which releases the GIL - safe and a real
@@ -279,9 +319,9 @@ def _read_frames_texts(per_frame_bands: list[list[Image.Image]]) -> list[list[st
     those stay sequential.
     """
     if len(per_frame_bands) <= 1 or config.OCR_ENGINE != "tesseract":
-        return [ocr.read_name_bands(bands) for bands in per_frame_bands]
+        return [ocr.read_name_bands(bands, profile) for bands in per_frame_bands]
 
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=len(per_frame_bands), thread_name_prefix="wf-ocr") as pool:
-        return list(pool.map(ocr.read_name_bands, per_frame_bands))
+        return list(pool.map(lambda bands: ocr.read_name_bands(bands, profile), per_frame_bands))

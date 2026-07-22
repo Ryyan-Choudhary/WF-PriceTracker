@@ -474,8 +474,22 @@ class App:
                 self.window.log(f"[{self.scan_count}] {match.name}: {price_line}")
             self._append_scan_log(match.name, price_line, "(grid)")
 
+        unreadable = 0
+
+        def on_unreadable(bbox, best_text: str) -> None:
+            nonlocal unreadable
+            unreadable += 1
+            if self.window:
+                self.window.add_multi_result_label(
+                    left + bbox[0], top + bbox[1], "Unreadable", f"OCR saw: {best_text[:40]}"
+                )
+                self.window.log(f"[slot] UNREADABLE - best OCR read: {best_text!r}")
+
         try:
-            pipeline.price_grid(frames, grid, (left, top), self.items_index, on_match=on_match)
+            pipeline.price_grid(
+                frames, grid, (left, top), self.items_index,
+                on_match=on_match, on_unreadable=on_unreadable,
+            )
         except Exception:
             log.exception("Grid scan OCR/pricing failed")
             if self.window:
@@ -484,10 +498,13 @@ class App:
 
         if self.window:
             total = grid["rows"] * grid["cols"]
+            suffix = f", {unreadable} unreadable" if unreadable else ""
             if found == 0:
-                self.window.log("No items recognized - check grid calibration / open the inventory first.")
+                self.window.log(
+                    f"No items recognized{suffix} - check grid calibration / open the inventory first."
+                )
             else:
-                self.window.log(f"--- Done: {found}/{total} slots identified ---")
+                self.window.log(f"--- Done: {found}/{total} slots identified{suffix} ---")
 
     def _append_scan_log(self, name: str, price_line: str, raw_display: str) -> None:
         timestamp = datetime.datetime.now().isoformat(timespec="seconds")

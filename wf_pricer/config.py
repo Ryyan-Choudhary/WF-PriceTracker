@@ -123,6 +123,15 @@ load_grid_calibration()
 GRID_SCAN_FRAMES = 3
 GRID_SCAN_FRAME_DELAY_S = 0.12
 
+# When a slot can't be identified on the first pass, re-read just that slot
+# using alternative preprocessing (see ocr.NAME_BAND_PROFILES): no
+# binarization, no upscaling, stricter/looser contrast, etc. Costs nothing
+# extra to capture (the frames we already grabbed get re-processed), and
+# rescues slots where one particular threshold mangled the text. Slots still
+# unidentified after every attempt get flagged UNREADABLE rather than
+# silently left blank, so you can tell "couldn't read it" from "empty slot".
+GRID_SCAN_MAX_RETRY_PROFILES = 6  # extra profiles beyond the default first pass
+
 # --- Selection mode ------------------------------------------------------
 # "single" - hover an item, press the scan hotkey; grabs a fixed-size box
 #            (BOX_WIDTH_PX x BOX_HEIGHT_PX) centered on the cursor.

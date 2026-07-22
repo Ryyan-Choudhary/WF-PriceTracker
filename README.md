@@ -60,6 +60,16 @@ back. Quit fully via the Quit button, the tray menu, or `Ctrl+F10`.
      the same slot reads slightly differently frame to frame; voting averages
      out background-induced misreads. If two frames disagree on which item a
      slot is (a tie), that slot is left unlabeled rather than guessed.
+   - **Automatic retries:** any slot that doesn't resolve gets re-read with
+     different preprocessing - dimmer thresholds, no binarization, no
+     upscaling, harder contrast - because a label that one threshold erases
+     another often reads perfectly (a faded item, or one whose ✓owned badge
+     skews the contrast). This reuses the frames already captured, so a retry
+     costs a little OCR time but no extra screen grab, and it stops at the
+     first profile that works. Slots still unidentified after every profile
+     are labelled **Unreadable** (with the best text OCR managed) rather than
+     left blank - so you can tell "couldn't read this" apart from "empty
+     slot".
 
    Any mode: results are logged in the window, and appended to
    `data/logs/scans.txt` with a timestamp so you keep a running record
@@ -225,9 +235,16 @@ seems to silently fail, check there first.
   for the per-slot vote detail, and tune in `config.py`:
   `GRID_BINARIZE_CUTOFF` (raise if backgrounds bleed through, lower if thin
   strokes vanish), `GRID_SCAN_FRAMES` (more frames = better voting but
-  slower). Grid Scan works with Tesseract and EasyOCR; the cloud vision
-  engines have no batch path so they'd make one API call per slot (slow +
-  costly) and aren't recommended for it.
+  slower), `GRID_SCAN_MAX_RETRY_PROFILES` (how many alternative
+  preprocessing passes to try on stubborn slots). Grid Scan works with
+  Tesseract and EasyOCR; the cloud vision engines have no batch path so
+  they'd make one API call per slot (slow + costly) and aren't recommended
+  for it.
+- **An "Unreadable" label means OCR saw text but couldn't identify it**, even
+  after all the retry profiles - the window log shows the best text it
+  managed, which usually points at the cause (name cut off by the band, a
+  badge bleeding in, or a faded/not-owned item). A slot with no label at all
+  simply had no text.
 - **Calibrate the grid band tightly around JUST the name text**, not the
   whole tile. If the band reaches up into the icon, it can catch the game's
   own `✓`/quantity badge on owned items (a stray "✓2" reads as garbage that
@@ -250,10 +267,10 @@ seems to silently fail, check there first.
 wf_pricer/
   config.py     settings: hotkeys, folders, box size, grid calibration, selection mode, OCR engine + API key storage
   scan.py       screen grabs (cursor box / region / multi-frame), global hotkeys, cursor tracking, drag-select watcher
-  ocr.py        Tesseract / EasyOCR / Claude / Gemini engines + Grid Scan name-band preprocessing & montage reader
+  ocr.py        Tesseract / EasyOCR / Claude / Gemini engines + name-band preprocessing profiles & montage reader
   items_db.py   catalog fetch/cache + two-stage anchored matching (base-name families, excludes Sets, refuses ties)
   market.py     warframe.market order fetch/cache (thread-safe) + concurrent get_prices + price averaging
-  pipeline.py   price_crop (single) / price_region (multi) / price_grid (grid) - concurrent pricing, parallel grid OCR
+  pipeline.py   price_crop (single) / price_region (multi) / price_grid (grid, retries + UNREADABLE) - concurrent pricing
   gui.py        app window + overlays (calibration, cursor box, grid outline, multi-result labels, result popup)
   tray.py       tray icon image
   main.py       app entry point (window + tray + hotkeys wiring, all three selection modes)
