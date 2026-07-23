@@ -23,7 +23,7 @@ from logging.handlers import RotatingFileHandler
 
 import pystray
 
-from . import config, gui, items_db, pipeline, scan
+from . import config, gui, items_db, market, pipeline, scan
 from . import tray as tray_mod
 
 log = logging.getLogger(__name__)
@@ -87,6 +87,7 @@ class App:
             self.items_index = items_db.load_items_index()
             if self.window:
                 self.window.log(f"Loaded {len(self.items_index)} items from warframe.market.")
+                self.window.set_search_catalog(self.items_index.search_entries())
         except Exception:
             log.exception("Could not load warframe.market item catalog; matching is disabled")
             if self.window:
@@ -113,6 +114,7 @@ class App:
             self._catalog_refresh_lock.release()
         if self.window:
             self.window.log(f"Refreshed: {len(self.items_index)} matchable items (Sets are always excluded).")
+            self.window.set_search_catalog(self.items_index.search_entries())
 
     # --- hotkey / button callbacks --------------------------------------
     def on_toggle_scan(self) -> None:
@@ -225,8 +227,64 @@ class App:
         if self.window:
             self.window.log(f"Price fetch concurrency set to {config.PRICE_FETCH_WORKERS} thread(s).")
 
+    def set_match_tolerance(self, cutoff: int) -> None:
+        # Takes effect on the next scan - items_db reads this cutoff live.
+        config.save_match_cutoff(cutoff)
+        if self.window:
+            self.window.log(f"Match cutoff set to {config.FUZZY_MATCH_SCORE_CUTOFF} (higher = stricter).")
+
+    # --- manual item lookup (search box) --------------------------------
+    def lookup_item(self, slug: str, name: str) -> None:
+        if self.window:
+            self.window.log(f"Looking up {name}...")
+        threading.Thread(target=self._lookup_item_worker, args=(slug, name), daemon=True).start()
+
+    def _lookup_item_worker(self, slug: str, name: str) -> None:
+        try:
+            stats = market.get_item_stats(slug)
+        except Exception:
+            log.exception("Item stats lookup failed for %s", slug)
+            if self.window:
+                self.window.show_item_stats(name, None)
+            return
+        if not self.window:
+            return
+        if not stats.has_data:
+            self.window.show_item_stats(name, None)
+            return
+        def stat_rows(label: str, points) -> list[tuple[str, str]]:
+            # One row per rank tier; ranked items get a row for the lowest and
+            # highest rank on the book, unranked items just one plain row.
+            rows = []
+            for rk, price in points:
+                suffix = f" (Rank {rk})" if rk is not None else ""
+                rows.append((f"{label}{suffix}", f"{price} p"))
+            return rows
+
+        volume = "—" if stats.volume_48h is None else f"{stats.volume_48h:,} sold"
+        lines = [
+            *stat_rows("Lowest sell", stats.lowest_sell),
+            *stat_rows("Highest sell", stats.highest_sell),
+            *stat_rows("Highest buy", stats.highest_buy),
+            ("48h volume", volume),
+            ("Sellers online", str(stats.sellers_online)),
+            ("Buyers online", str(stats.buyers_online)),
+        ]
+        self.window.show_item_stats(name, lines)
+
+    def open_search(self) -> None:
+        # Global search hotkey: bring the window forward and drop the cursor in
+        # the search box, so you can look a price up without alt-tabbing.
+        if self._capturing_hotkey:
+            return
+        if self.window:
+            self.window.open_search()
+
     # --- hotkeys ---------------------------------------------------------
-    _HK_ACTION_LABELS = {"toggle": "Toggle scan mode", "scan": "Scan now", "quit": "Quit"}
+    _HK_ACTION_LABELS = {
+        "toggle": "Toggle scan mode", "scan": "Scan now",
+        "search": "Open search", "quit": "Quit",
+    }
 
     def begin_hotkey_capture(self) -> None:
         # Suppress the global listener's actions until set_hotkey clears this,
@@ -254,6 +312,7 @@ class App:
             "scan": config.HOTKEY_SCAN,
             "toggle": config.HOTKEY_TOGGLE_SCAN,
             "quit": config.HOTKEY_QUIT,
+            "search": config.HOTKEY_SEARCH,
         }
         for other, existing in current.items():
             if other != action and existing == hotkey:
@@ -265,7 +324,10 @@ class App:
                 return
 
         current[action] = hotkey
-        config.save_hotkeys(scan=current["scan"], toggle=current["toggle"], quit_=current["quit"])
+        config.save_hotkeys(
+            scan=current["scan"], toggle=current["toggle"],
+            quit_=current["quit"], search=current["search"],
+        )
         if self.hotkeys is not None:
             try:
                 self.hotkeys.restart()
@@ -642,14 +704,17 @@ def main() -> None:
         on_selection_mode_change=app.set_selection_mode,
         on_calibrate_grid=app.calibrate_grid,
         on_price_workers_change=app.set_price_workers,
+        on_match_tolerance_change=app.set_match_tolerance,
         on_set_hotkey=app.set_hotkey,
         on_hotkey_capture_start=app.begin_hotkey_capture,
+        on_lookup_item=app.lookup_item,
         on_quit=app.on_quit,
     )
     app.window = window
     window.set_engine_selection(config.OCR_ENGINE)
     window.set_selection_mode_selection(config.SELECTION_MODE)
     window.set_price_workers(config.PRICE_FETCH_WORKERS)
+    window.set_match_tolerance(config.FUZZY_MATCH_SCORE_CUTOFF)
 
     if config.BOX_WIDTH_PX is not None and config.BOX_HEIGHT_PX is not None:
         window.set_box_size_label(f"Box size: {config.BOX_WIDTH_PX}x{config.BOX_HEIGHT_PX}px")
@@ -664,7 +729,10 @@ def main() -> None:
     if config.OCR_ENGINE == "easyocr":
         window.log("(First EasyOCR run will download its model weights - needs internet, one-time.)")
 
-    hotkeys = scan.HotkeyListener(on_scan=app.on_scan, on_toggle_scan=app.on_toggle_scan, on_quit=app.on_quit)
+    hotkeys = scan.HotkeyListener(
+        on_scan=app.on_scan, on_toggle_scan=app.on_toggle_scan,
+        on_quit=app.on_quit, on_search=app.open_search,
+    )
     app.hotkeys = hotkeys  # so rebinds can restart it
     hotkeys.start()
 

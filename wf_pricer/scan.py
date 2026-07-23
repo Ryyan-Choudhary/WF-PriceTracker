@@ -41,6 +41,49 @@ def get_cursor_position() -> tuple[int, int]:
     return int(x), int(y)
 
 
+def primary_screen_size() -> tuple[int, int]:
+    """(width, height) of the PRIMARY monitor in physical pixels - used to
+    centre the quick-search / stats popups predictably regardless of where the
+    (possibly hidden) main window is."""
+    user32 = ctypes.windll.user32
+    SM_CXSCREEN, SM_CYSCREEN = 0, 1
+    return user32.GetSystemMetrics(SM_CXSCREEN), user32.GetSystemMetrics(SM_CYSCREEN)
+
+
+def force_foreground(window) -> None:
+    """Best-effort: make a Tk window the Windows FOREGROUND window so it can
+    take keyboard input immediately - even when opened from a global hotkey
+    while a game holds focus.
+
+    Windows blocks a background process from calling SetForegroundWindow on its
+    own, so this uses the standard AttachThreadInput trick: briefly share input
+    state with whatever window is currently in front, then raise ours. Wrapped
+    in try/finally so the attach is always undone, and swallows failures (worst
+    case the user clicks the bar once, i.e. today's behaviour).
+    """
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        GA_ROOT = 2
+        hwnd = user32.GetAncestor(int(window.winfo_id()), GA_ROOT)
+        if not hwnd:
+            return
+        foreground = user32.GetForegroundWindow()
+        if not foreground or foreground == hwnd:
+            user32.SetForegroundWindow(hwnd)
+            return
+        target_thread = user32.GetWindowThreadProcessId(foreground, None)
+        our_thread = kernel32.GetCurrentThreadId()
+        user32.AttachThreadInput(our_thread, target_thread, True)
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            user32.AttachThreadInput(our_thread, target_thread, False)
+    except Exception:
+        log.debug("force_foreground failed", exc_info=True)
+
+
 def grab_box_at(cx: int, cy: int, box_w: int, box_h: int) -> Image.Image:
     """Grabs a box_w x box_h region of the screen centered on (cx, cy),
     clamped so it never reaches past the virtual desktop's edges.
@@ -176,10 +219,12 @@ class HotkeyListener:
         on_scan: Callable[[], None],
         on_toggle_scan: Callable[[], None],
         on_quit: Callable[[], None],
+        on_search: Callable[[], None],
     ) -> None:
         self._on_scan = on_scan
         self._on_toggle_scan = on_toggle_scan
         self._on_quit = on_quit
+        self._on_search = on_search
         self._listener: keyboard.GlobalHotKeys | None = None
         self._build()
 
@@ -192,6 +237,7 @@ class HotkeyListener:
                 config.HOTKEY_SCAN: self._on_scan,
                 config.HOTKEY_TOGGLE_SCAN: self._on_toggle_scan,
                 config.HOTKEY_QUIT: self._on_quit,
+                config.HOTKEY_SEARCH: self._on_search,
             }
         )
 

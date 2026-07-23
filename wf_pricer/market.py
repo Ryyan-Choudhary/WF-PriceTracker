@@ -41,6 +41,39 @@ class PriceEstimate:
         return self.sample_size > 0
 
 
+# One (rank, platinum) point for a headline stat. rank is None for items that
+# aren't ranked; otherwise it's the mod/arcane rank that price applies to.
+RankPrice = tuple[Optional[int], int]
+
+
+@dataclass(frozen=True)
+class ItemStats:
+    """A fuller market picture than PriceEstimate for the manual lookup, built
+    entirely from the live order book (the v2 orders endpoint): the sell side
+    (lowest / highest ask, how many sellers online) and the buy side (best
+    offer, how many buyers online). volume_48h has no v2 source, so it's pulled
+    best-effort from the deprecated v1 statistics endpoint (None if unreachable).
+
+    Each of the three price stats is a tuple of (rank, platinum) points. For an
+    UNRANKED item that's a single (None, price). For a RANKED item (mods,
+    arcanes) it's the value at the lowest AND highest rank on the book - a Rank
+    0 and a Rank 5 arcane trade at completely different prices, so one blended
+    number would be meaningless. Collapses to one point when only one rank is
+    listed.
+    """
+    slug: str
+    lowest_sell: tuple[RankPrice, ...]
+    highest_sell: tuple[RankPrice, ...]
+    highest_buy: tuple[RankPrice, ...]
+    volume_48h: Optional[int]
+    sellers_online: int
+    buyers_online: int
+
+    @property
+    def has_data(self) -> bool:
+        return self.sellers_online > 0 or self.buyers_online > 0 or bool(self.volume_48h)
+
+
 def _load_disk_cache() -> None:
     global _cache, _cache_loaded
     with _cache_lock:
@@ -178,6 +211,111 @@ def get_price(slug: str) -> PriceEstimate:
         _cache[slug] = {"ts": now, "estimate": estimate.__dict__}
         _schedule_disk_save()
     return estimate
+
+
+def _order_rank(order: dict) -> Optional[int]:
+    """The mod/arcane rank on an order, or None if the item isn't ranked. Tries
+    the v2 field first, then older/alternative spellings, so a Rank 0 listing
+    still reports 0 (a real rank) rather than being mistaken for unranked."""
+    for key in ("rank", "modRank", "mod_rank"):
+        value = order.get(key)
+        if isinstance(value, (int, float)):
+            return int(value)
+    return None
+
+
+# The 48-hour trade volume has no v2 endpoint; this is the (deprecated) v1
+# statistics endpoint, used ONLY for that number and allowed to fail quietly.
+_WFM_V1_BASE = "https://api.warframe.market/v1"
+
+
+def _fetch_48h_volume(slug: str) -> Optional[int]:
+    """Items traded in the last 48h, from the deprecated v1 statistics endpoint.
+    None when it can't be reached (network / endpoint gone); a real 0 when the
+    item simply hasn't sold."""
+    try:
+        resp = requests.get(
+            f"{_WFM_V1_BASE}/items/{slug}/statistics",
+            headers={"accept": "application/json", "Platform": config.WFM_PLATFORM},
+            timeout=config.HTTP_TIMEOUT_SECONDS,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        payload = resp.json().get("payload")
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("Stats: could not fetch 48h volume for %s: %s", slug, exc)
+        return None
+    if not payload:
+        return None
+    for key in ("statistics_closed", "statistics_live"):
+        buckets = (payload.get(key) or {}).get("48hours")
+        if buckets:
+            return sum(int(b.get("volume") or 0) for b in buckets)
+    return 0
+
+
+def _rank_tiers(orders: list[dict], reduce_fn) -> tuple[RankPrice, ...]:
+    """Reduce one side's orders to (rank, platinum) points via reduce_fn (min
+    for a "lowest", max for a "highest").
+
+    Unranked items -> a single (None, price). Ranked items -> the value at the
+    LOWEST and HIGHEST rank present (so a Rank 0 and a Rank 5 arcane are each
+    reported), collapsing to one point when only one rank is on the book. An
+    empty side -> ((None, 0),) so a row still shows.
+    """
+    if not orders:
+        return ((None, 0),)
+    ranks = [_order_rank(o) for o in orders]
+    if all(r is None for r in ranks):
+        return ((None, int(reduce_fn(int(o["platinum"]) for o in orders))),)
+
+    present = sorted({r for r in ranks if r is not None})
+    tiers: list[RankPrice] = []
+    for rank in (present[0], present[-1]):
+        prices = [int(o["platinum"]) for o, r in zip(orders, ranks) if r == rank]
+        point: RankPrice = (rank, int(reduce_fn(prices)))
+        if point not in tiers:  # collapse when min rank == max rank
+            tiers.append(point)
+    return tuple(tiers)
+
+
+def get_item_stats(slug: str) -> ItemStats:
+    """Market snapshot for one item, for the manual search popup.
+
+    The order book (lowest / highest ask, highest bid, online counts, and - for
+    ranked mods/arcanes - the value at each rank tier) comes from the v2 orders
+    endpoint; the 48h trade volume comes best-effort from v1. Never raises: a
+    failed fetch yields an empty book / None volume, and has_data reports
+    whether anything came back.
+    """
+    try:
+        orders = _fetch_orders(slug)
+    except requests.RequestException as exc:
+        log.warning("Stats: could not fetch orders for %s: %s", slug, exc)
+        orders = []
+
+    def online(kind: str) -> list[dict]:
+        picked = [
+            o for o in orders
+            if o.get("type") == kind and o.get("visible", True)
+            and (o.get("user") or {}).get("status") in config.PREFERRED_USER_STATUSES
+            and isinstance(o.get("platinum"), (int, float))
+        ]
+        return sorted(picked, key=lambda o: o["platinum"])
+
+    sells = online("sell")
+    buys = online("buy")
+
+    return ItemStats(
+        slug=slug,
+        lowest_sell=_rank_tiers(sells, min),
+        highest_sell=_rank_tiers(sells, max),
+        highest_buy=_rank_tiers(buys, max),
+        volume_48h=_fetch_48h_volume(slug),
+        sellers_online=len(sells),
+        buyers_online=len(buys),
+    )
 
 
 def get_prices(

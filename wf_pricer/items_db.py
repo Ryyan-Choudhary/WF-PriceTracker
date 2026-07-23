@@ -92,6 +92,10 @@ class ItemsIndex:
     """
 
     def __init__(self, items: list[Item]):
+        # Full catalog kept for manual search only (which SHOULD find sets -
+        # people look up "Rhino Prime Set" prices); matching still works off
+        # the set-excluded list below.
+        self._all_items = list(items)
         self._items = [it for it in items if "set" not in it.tags]
         # rapidfuzz wants a flat sequence of choices to score against;
         # keep a parallel list of Item objects to map matches back.
@@ -112,6 +116,11 @@ class ItemsIndex:
 
     def __len__(self) -> int:
         return len(self._items)
+
+    def search_entries(self) -> list[tuple[str, str]]:
+        """(name, slug) for every catalog item INCLUDING sets, alphabetically,
+        for the manual search box's autocomplete."""
+        return sorted(((it.name, it.slug) for it in self._all_items), key=lambda t: t[0].lower())
 
     def match(self, text: str) -> Optional[Item]:
         """Match a raw OCR string to a known item, in two stages.

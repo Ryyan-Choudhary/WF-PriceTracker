@@ -26,6 +26,7 @@ BOX_CALIBRATION_FILE = CACHE_DIR / "box_calibration.json"
 GRID_CALIBRATION_FILE = CACHE_DIR / "grid_calibration.json"
 OCR_ENGINE_FILE = CACHE_DIR / "ocr_engine.json"
 HOTKEYS_FILE = CACHE_DIR / "hotkeys.json"
+MATCH_TOLERANCE_FILE = CACHE_DIR / "match_tolerance.json"
 ANTHROPIC_API_KEY_FILE = CACHE_DIR / "anthropic_api_key.json"
 GOOGLE_API_KEY_FILE = CACHE_DIR / "google_api_key.json"
 LOG_FILE = LOGS_DIR / "app.log"
@@ -39,11 +40,12 @@ SCAN_LOG_FILE = LOGS_DIR / "scans.txt"
 HOTKEY_SCAN = "<f9>"           # scan a box centered on the cursor (only while scan mode is on)
 HOTKEY_TOGGLE_SCAN = "<f10>"   # turn scan mode on / off
 HOTKEY_QUIT = "<ctrl>+<f10>"   # quit the app entirely
+HOTKEY_SEARCH = "<f8>"         # bring the window forward and open the manual item search
 
 
 def load_hotkeys() -> None:
     """Loads any rebindings from hotkeys.json over the defaults above."""
-    global HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT
+    global HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH
     if not HOTKEYS_FILE.exists():
         return
     try:
@@ -53,13 +55,15 @@ def load_hotkeys() -> None:
     HOTKEY_SCAN = data.get("scan") or HOTKEY_SCAN
     HOTKEY_TOGGLE_SCAN = data.get("toggle") or HOTKEY_TOGGLE_SCAN
     HOTKEY_QUIT = data.get("quit") or HOTKEY_QUIT
+    HOTKEY_SEARCH = data.get("search") or HOTKEY_SEARCH
 
 
-def save_hotkeys(scan: str, toggle: str, quit_: str) -> None:
-    global HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT
-    HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT = scan, toggle, quit_
+def save_hotkeys(scan: str, toggle: str, quit_: str, search: str) -> None:
+    global HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH
+    HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH = scan, toggle, quit_, search
     HOTKEYS_FILE.write_text(
-        json.dumps({"scan": scan, "toggle": toggle, "quit": quit_}), encoding="utf-8"
+        json.dumps({"scan": scan, "toggle": toggle, "quit": quit_, "search": search}),
+        encoding="utf-8",
     )
 
 
@@ -411,7 +415,40 @@ def clear_google_api_key() -> None:
     GOOGLE_API_KEY_FILE.unlink(missing_ok=True)
 
 # --- Item matching -----------------------------------------------------
-FUZZY_MATCH_SCORE_CUTOFF = 86  # 0-100, higher = stricter (fewer false positives)
+# The minimum similarity (0-100) a candidate must reach to be reported at all.
+# This IS the "guess vs. unmatched" line: a read scoring below it is declared
+# unmatched instead of being forced onto the nearest item. Higher = stricter
+# (fewer wrong guesses, more "unmatched"); lower = more tolerant of messy OCR
+# (more guesses, more chance of a wrong one). User-tunable via the Settings
+# tab (persisted to match_tolerance.json); the bounds keep it in a sane range
+# - below ~70 the catalog starts matching noise, above ~96 real reads with a
+# little OCR damage get rejected.
+FUZZY_MATCH_SCORE_CUTOFF = 86
+FUZZY_MATCH_SCORE_CUTOFF_MIN = 72
+FUZZY_MATCH_SCORE_CUTOFF_MAX = 95
+
+
+def _clamp_match_cutoff(n: int) -> int:
+    return max(FUZZY_MATCH_SCORE_CUTOFF_MIN, min(FUZZY_MATCH_SCORE_CUTOFF_MAX, n))
+
+
+def load_match_cutoff() -> None:
+    global FUZZY_MATCH_SCORE_CUTOFF
+    if not MATCH_TOLERANCE_FILE.exists():
+        return
+    try:
+        data = json.loads(MATCH_TOLERANCE_FILE.read_text(encoding="utf-8"))
+        FUZZY_MATCH_SCORE_CUTOFF = _clamp_match_cutoff(int(data["cutoff"]))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        pass
+
+
+def save_match_cutoff(cutoff: int) -> None:
+    global FUZZY_MATCH_SCORE_CUTOFF
+    FUZZY_MATCH_SCORE_CUTOFF = _clamp_match_cutoff(cutoff)
+    MATCH_TOLERANCE_FILE.write_text(json.dumps({"cutoff": FUZZY_MATCH_SCORE_CUTOFF}), encoding="utf-8")
+
+
 # If the best match doesn't beat the second-best by at least this many
 # points, treat it as ambiguous and refuse to match at all, rather than
 # arbitrarily picking one. This matters a lot for Prime parts: OCR text
@@ -455,6 +492,8 @@ FUZZY_TIEBREAK_MAX_EXTRA_WORDS = 2
 FUZZY_ANCHOR_SCORE_CUTOFF = 65  # how close a word must be to a base name to pull in that family
 FUZZY_ANCHOR_MIN_TOKEN_LEN = 3  # ignore tiny OCR specks ("O2", "a", "4") when anchoring
 FUZZY_ANCHOR_MAX_FAMILIES = 10   # families pulled in per word of the text
+
+load_match_cutoff()  # apply any persisted tolerance override over the default
 
 # --- Pricing -----------------------------------------------------------
 # How many of the cheapest current sell orders to average together.

@@ -1,156 +1,288 @@
 # WF-PriceTracker
 
-An attempt to make pricing your warframe inventory easier.
+A non-invasive desktop companion that prices your Warframe inventory by
+**reading your screen with OCR** and looking each item up on **warframe.market**
+for you — no game files, memory, or network traffic touched.
 
-A Windows app (with a tray icon too) for pricing your Warframe items: set a
-box size once, then either check one item at a time by hovering it and
-hitting a hotkey, or drag a box around a whole shelf of items at once and
-get every one of them priced in place.
+> **SCRN1** — _main window, Single tab (idle)_
 
-## How it works
+&nbsp;
 
-A window opens when you launch the app, showing status, a live log, and
-buttons for everything. There's also a tray icon (cyan diamond = idle, red =
-scan mode on) — closing the window with the X just hides it there;
-left-click the tray icon or use its "Show window" menu item to bring it
-back. Quit fully via the Quit button, the tray menu, or `Ctrl+F10`.
+---
 
-1. **Selection Mode** — pick **Single Item**, **Multi-Select**, or **Grid
-   Scan** (radio buttons near the top). Switchable any time, including while
-   scan mode is on.
-2. **Scan mode** — `F10` (or "Start Scan Mode") toggles scan mode on/off.
-   What happens next depends on the selection mode:
+## What is this, and why does it exist?
 
-   **Single Item** (the classic flow):
-   - Once, click **"Set Item Box Size..."** and drag a box around one
-     item's icon+name in-game (works live, no screenshot needed first).
-     This is the size of the region grabbed around your cursor on every
-     scan afterwards.
-   - While scan mode is on, hover an item and press `F9` (or click "Scan
-     Now"). Grabs a box of your configured size centered on the cursor,
-     OCRs it, matches it, and shows the price in a popup next to your
-     cursor (auto-dismisses, or click to dismiss early).
-![Screenshot1](gpage/singleselect.png)
-![Screenshot2](gpage/singleprice.png)
+### A word on Warframe
 
-   **Multi-Select** (for scanning a whole batch at once):
-   - While scan mode is on, left-click-drag a box around however many
-     items you want (any size, no pre-calibration needed) and release.
-   - That whole region gets captured, OCR'd for every item inside it, and
-     each one gets a name+price label drawn directly over it on screen,
-     added one at a time as each is found and priced. Labels stay up until
-     the next drag (starting a new drag immediately clears the old ones).
-![Screenshot3](gpage/multiselect.png)
-![Screenshot4](gpage/multiprice.png)
+[Warframe](https://www.warframe.com/) is a free-to-play, third-person
+**looter-shooter MMO** by Digital Extremes — you play a space ninja (a "Tenno"
+piloting a biomechanical **Warframe**) blasting and slicing through the solar
+system for loot. It's a genuinely enormous game: hundreds of weapons,
+Warframes, mods, and relics, all grindable for free.
 
-   **Grid Scan** (WFInfo-style, most accurate on a full inventory page):
-   - One-time setup: click **"Calibrate Grid..."** and drag a box around the
-     FIRST (top-left) item's name text, then the LAST (bottom-right) item's
-     name text, then enter how many rows and columns the grid has. That
-     fixes the exact position of every slot's name label. (Warframe's grid is
-     evenly spaced, so first + last + counts pins down the whole thing;
-     deriving the spacing from the full span keeps measurement error small.)
-   - While scan mode is on, a cyan outline shows the calibrated slots so you
-     can confirm they line up. Open your inventory and press `F9`: it grabs a
-     few rapid frames of the grid, reads *just each slot's name band* (tightly
-     cropped, contrast-boosted, and thresholded to isolate the bright text
-     from the animated card art - like WFInfo), votes across the frames for
-     each slot, and labels every identified slot with its price.
-   - Why the multi-frame vote: Warframe's item-card backgrounds animate, so
-     the same slot reads slightly differently frame to frame; voting averages
-     out background-induced misreads. If two frames disagree on which item a
-     slot is (a tie), that slot is left unlabeled rather than guessed.
-   - **Automatic retries:** any slot that doesn't resolve gets re-read with
-     different preprocessing - dimmer thresholds, no binarization, no
-     upscaling, harder contrast - because a label that one threshold erases
-     another often reads perfectly (a faded item, or one whose ✓owned badge
-     skews the contrast). This reuses the frames already captured, so a retry
-     costs a little OCR time but no extra screen grab, and it stops at the
-     first profile that works. Slots still unidentified after every profile
-     are labelled **Unreadable** (with the best text OCR managed) rather than
-     left blank - so you can tell "couldn't read this" apart from "empty
-     slot".
+I've personally got **around 250 hours in it as of this update** — enough to
+have accumulated the kind of overflowing inventory that makes this tool
+worth building.
 
-   Any mode: results are logged in the window, and appended to
-   `data/logs/scans.txt` with a timestamp so you keep a running record
-   across a play session. The window log includes the raw text the OCR
-   engine actually read (Single/Multi) or per-slot vote detail (Grid, in
-   `data/logs/app.log`), so if a scan matches the wrong item (or nothing),
-   you can see why.
-3. `F10` again turns scan mode off.
+### Warframe's economy and player trading
 
-Each Single Item scan is one deliberate action covering exactly one item, so
-there's no "more prices than items" ambiguity. Multi-Select trades that for
-convenience across a freehand region (it can't promise a 1:1 box-to-item
-ratio). Grid Scan gets the best of both on a real inventory page: a fixed,
-pre-calibrated slot layout means each slot is cropped and read in isolation,
-which is the most robust against dense grids and busy backgrounds - at the
-cost of the one-time calibration. All three apply the same fuzzy-matching,
-Set-exclusion, and "refuse ambiguous ties" rules.
+What makes Warframe special is its **player-driven economy**. The premium
+currency, **Platinum**, can be bought with real money — *or* earned entirely
+for free by **trading items with other players**. Prime parts, mods, arcanes,
+relics, rivens: almost everything tradable has a going rate in Platinum, and a
+dedicated free-to-play player can trade their way to just about anything the
+paid shortcut offers. That's the beauty of it — **paid or not, anyone can
+participate in the market and make premium currency.**
 
-## OCR Engine
+### warframe.market — and its blind spot
 
-Pick which engine reads the crop, via the **"OCR Engine"** dropdown in the
-window (persisted across restarts):
+The community coordinates all this trading on
+[**warframe.market**](https://warframe.market/): players post buy/sell orders
+with prices, and you look up what your stuff is worth before trading.
 
-- **Tesseract** (default) — a local classical OCR engine. No warm-up cost -
-  consistently ~0.2-0.3s per scan once Windows has cached the executable
-  (the very first scan of a session might take ~1s extra for that). Fully
-  offline.
-- **EasyOCR** — a local deep-learning OCR engine. More accurate on
-  messy/stylized game text than Tesseract, but pays a one-time ~15s cost
-  loading its model the *first* scan of each app run (not per scan); after
-  that, roughly a couple of seconds per scan on a small box. No internet
-  needed after its one-time model download. Worth switching to if Tesseract
-  keeps misreading a particular screen.
-- **Claude Vision** / **Gemini Vision** — send the crop to Anthropic's or
-  Google's API to read directly instead of running OCR locally. **Currently
-  disabled in the UI (still in development)** - the dropdown shows them
-  labeled "(in development)" but selecting one snaps back to whatever was
-  actually active, and their "Set Anthropic Key..." / "Set Google Key..."
-  buttons are greyed out. The underlying code paths work if you set
-  `config.OCR_ENGINE` directly (or edit `data/cache/ocr_engine.json`) and
-  provide a key via the mechanism below, but there's no supported UI path to
-  them yet. When enabled, multi-select region scanning is a known gap for
-  these two specifically - the vision prompt currently expects one item per
-  image, not a whole region of several.
+The catch: **warframe.market has no idea what's in *your* inventory.** It only
+knows about listings. So to price your collection, you end up **typing every
+single item name into the site one at a time**, reading the going rate, and
+moving on to the next. For a full inventory that's tedious, mind-numbing work.
 
-**Never put a real API key as a literal in `wf_pricer/config.py`** - that
-file is tracked by git, so committing it would leak the key. Keys are
-meant to live in `data/cache/anthropic_api_key.json` /
-`data/cache/google_api_key.json` (both gitignored), or the
-`ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) environment
-variables as a fallback.
+### Why I built this instead of using the existing tools
 
-## Speed: the "Price threads" slider
+Tools like **Overframe's companion** and **AlecaFrame** solve the
+inventory-awareness problem by integrating far more deeply with the game —
+being able to to pull your inventory directly. They're powerful, but that level 
+of access is more than I'm comfortable with pointed at my game client.
+ **I didn't like the invasiveness**,so I decided to make my own.
 
-On a scan with lots of items (Multi-Select or Grid Scan), the slow part isn't
-the OCR - it's fetching each item's live price from warframe.market, one
-network request per unique item. The **"Price threads"** slider controls how
-many of those requests run at once:
+**WF-PriceTracker takes the opposite approach: it only looks at pixels already
+on your screen.** It **OCRs** whatever inventory screen you're looking at,
+**fuzzy-matches** the text to real item names, and **fetches live prices from
+warframe.market** — turning "type in 40 item names by hand" into "press a
+hotkey." It reads nothing but the screen you're already showing anyone who
+walks past your monitor. (This is the same non-invasive philosophy as
+[WFInfo](https://github.com/WFCD/WFinfo), the well-known relic-reward OCR tool
+that inspired the Grid Scan mode.)
 
-- **1 (default, safe)** - fully sequential, exactly the original behaviour.
-  Stays within warframe.market's request etiquette (~3 req/s given the
-  built-in per-request delay). No risk to your account/IP.
-- **Higher** - fetches several prices concurrently, overlapping the network
-  latency, so a cold-cache full-grid scan finishes much faster (measured
-  ~6x faster on the pricing phase at 6 threads in a mocked test). **But** it
-  also issues requests faster: warframe.market may return HTTP 429 or
-  temporarily rate-limit your IP if you push it too high. The slider labels
-  the zone (`safe` / `polite` / `may rate-limit`) - it's your call how far to
-  go, since it's your IP. If scans start failing to price, slide it back down.
+---
 
-Prices are cached for 10 minutes, so re-scanning the same items shortly after
-is instant regardless of this setting - the slider only matters for
-first-time (cold-cache) lookups. Grid Scan additionally OCRs its multiple
-capture frames in parallel when using the Tesseract engine (a safe, local
-speedup with no API involved).
+## Built with
+
+The software-development side of things, for the curious:
+
+| Area | Tools |
+|------|-------|
+| **Language** | Python 3.11 |
+| **GUI** | Tkinter / ttk (standard library), with a hand-rolled dark theme |
+| **Local OCR** | [Tesseract](https://github.com/tesseract-ocr/tesseract) (via `pytesseract`), [EasyOCR](https://github.com/JaidedAI/EasyOCR) (PyTorch deep-learning) |
+| **Cloud AI OCR** *(optional, in development)* | Claude Vision — Anthropic `claude-haiku-4-5`; Gemini Vision — Google `gemini-2.5-flash` |
+| **Image handling** | [Pillow](https://python-pillow.org/) |
+| **Fuzzy matching** | [RapidFuzz](https://github.com/maxbachmann/RapidFuzz) |
+| **Global hotkeys & mouse tracking** | [pynput](https://github.com/moses-palmer/pynput) |
+| **System tray** | [pystray](https://github.com/moses-palmer/pystray) |
+| **HTTP** | [requests](https://requests.readthedocs.io/) |
+| **Market data** | the [warframe.market API](https://warframe.market/) — v2 orders endpoint for live prices, v1 statistics endpoint (best-effort) for 48-hour trade volume |
+| **Windows integration** | `ctypes` for DPI awareness, screen metrics, and foreground-focus handling |
+
+---
+
+## Features at a glance
+
+The window is organised into tabs — **Single**, **Multi-Select**, **Grid
+Scan**, and **Settings** — plus a magnifying-glass **search** button in the
+top-left. A tray icon (cyan diamond = idle, red = scan mode on) keeps it out of
+the way; closing the window with the X just hides it to the tray. Quit fully via
+the **Quit** button, the tray menu, or the quit hotkey (`Ctrl+F10` by default).
+
+### Single Item
+
+Hover one item in-game and press the scan hotkey (`F9` by default). The app
+grabs a fixed-size box centred on your cursor, OCRs it, matches it, and shows
+the price in a small popup right next to your cursor.
+
+- One-time setup: click **"Set Item Box Size…"** and drag a box around one
+  item's icon+name in-game. That's the size grabbed around your cursor on every
+  scan afterwards.
+- Each scan is one deliberate action covering exactly one item — no "more
+  prices than items" ambiguity.
+
+> **SCRN2** — _Single Item: the cursor target box, and the result popup_
+
+&nbsp;
+
+### Multi-Select
+
+Drag a box around a whole shelf of items at once. On release, the entire region
+is captured, OCR'd for every item inside, and each one gets a **name + price
+label drawn directly over it on screen**, filled in one at a time as each is
+found and priced. Labels stay up until your next drag.
+
+> **SCRN3** — _Multi-Select: price labels drawn over a batch of items_
+
+&nbsp;
+
+### Grid Scan (WFInfo-style — most accurate on a full inventory page)
+
+Calibrate a fixed grid of inventory slots once (box the first and last slot's
+name text, enter the rows/columns), then press the scan hotkey with your
+inventory open. It grabs a few rapid frames, reads **just each slot's name
+band** (tightly cropped and contrast-boosted to isolate the bright text from
+the animated card art), **votes across the frames**, and labels every slot with
+its price.
+
+- **Multi-frame voting** cancels out the misreads caused by Warframe's animated
+  item-card backgrounds. If frames disagree on a slot (a tie), it's left
+  unlabeled rather than guessed.
+- **Automatic retries:** unresolved slots are re-read with different
+  preprocessing (dimmer thresholds, no binarization, harder contrast) — a label
+  one threshold erases, another often reads perfectly. Slots still unidentified
+  after every attempt are marked **Unreadable** (with the best text OCR
+  managed), so "couldn't read this" is distinct from "empty slot".
+
+> **SCRN4** — _Grid Scan: the calibrated slot outline and priced slots_
+
+&nbsp;
+
+### Search — look up any item by name
+
+Click the **magnifying-glass icon** (top-left, next to the title) or press the
+**search hotkey** (`F8` by default). The search hotkey pops a small, already-
+focused search bar anywhere — no need to bring up or click into the main window
+— so you can price-check mid-game without alt-tabbing.
+
+Type an item name (with live **autocomplete** over the full catalog, Sets
+included), press Enter, and a compact **stats popup** shows its live market
+picture from warframe.market:
+
+- **Lowest / Highest sell** and **Highest buy** — the current order book.
+- **For ranked items (mods, arcanes),** each of those is split into its value
+  at the **lowest and highest rank** on the book (a Rank 0 and a Rank 5 arcane
+  are completely different prices).
+- **48h volume** — how many traded in the last two days (best-effort).
+- **Sellers / Buyers online** — a live read on supply and demand.
+
+> **SCRN5** — _the quick-search bar with autocomplete suggestions_
+
+&nbsp;
+
+> **SCRN6** — _the item stats popup (a ranked arcane, showing per-rank prices)_
+
+&nbsp;
+
+---
+
+## The Settings tab
+
+Everything configurable lives on the **Settings** tab, grouped into sections.
+Changes are saved to `data/cache/` and persist across restarts.
+
+> **SCRN7** — _the Settings tab_
+
+&nbsp;
+
+### OCR & speed
+
+- **OCR engine** — which engine reads each crop (see
+  [OCR: how it reads, and where it fails](#ocr-how-it-reads-and-where-it-fails)
+  below).
+- **Price threads** — how many warframe.market price lookups run at once. On a
+  big scan the slow part isn't the OCR, it's the one-network-request-per-item
+  pricing. `1` is fully sequential and safest; higher overlaps the network
+  latency for much faster cold-cache scans, but issues requests faster too, so
+  warframe.market may rate-limit your IP if you push it. The slider labels the
+  zone (`safe` / `polite` / `may rate-limit`) — it's your IP, your call.
+  (Prices are cached for 10 minutes, so this only matters for first-time
+  lookups.)
+
+### Matching
+
+- **Fault tolerance** — this is the dial for *where the app decides to guess vs.
+  give up*. OCR is imperfect; this controls how close a read has to be to a real
+  item name before the app commits to a match. **Higher tolerance** guesses on
+  messier reads (at the risk of the occasional wrong guess); **lower tolerance**
+  reports "unmatched" rather than risk reporting the wrong item. If you're
+  seeing wrong matches, dial it down; if too many reads come back unmatched,
+  dial it up.
+
+### Hotkeys
+
+All four hotkeys are **rebindable** — click **"Change…"** and press the key or
+combo you want. Defaults:
+
+| Action | Default | What it does |
+|--------|---------|--------------|
+| Toggle scan mode | `F10` | Turn scan mode on/off |
+| Scan now | `F9` | Scan at cursor (Single) / scan the grid (Grid) |
+| Open search | `F8` | Pop the quick-search bar |
+| Quit app | `Ctrl+F10` | Quit entirely |
+
+The current **search** binding is also shown right next to the magnifier icon
+in the header, so the shortcut stays discoverable.
+
+### Catalog & API keys
+
+- **Refresh Item List** — force an immediate refetch of the warframe.market item
+  catalog (e.g. right after a new item drops), bypassing the 3-day cache.
+- **Anthropic Key… / Google Key…** — for the cloud AI OCR engines. *Greyed out
+  while those engines are in development* (see below).
+
+---
+
+## OCR: how it reads, and where it fails
+
+**OCR is not magic, and it is not infallible.** The whole approach rests on
+turning pixels of stylised game text into characters, and that can and does
+fail. It's important to understand the failure modes rather than expecting 100%:
+
+- **Faded / not-owned items** (shown ghosted in the inventory) have dim text
+  that OCR frequently can't read cleanly — they may simply not get a price.
+- **Icon-only tiles** with no visible name text can't be matched at all — OCR
+  needs actual text to read.
+- **Decorative fonts, busy animated backgrounds, and owned-item badges** (the
+  `✓`/quantity marker) all interfere, which is exactly what Grid Scan's
+  multi-frame voting and retry profiles are there to fight.
+- **A too-small box** clips the name (no match); **too-large** catches a
+  neighbour's name. Even a perfect engine can't match text it wasn't given.
+
+When a read is genuinely ambiguous, the app **refuses to guess** rather than
+report a wrong price — you'll see "No item recognized" or an **Unreadable**
+label instead. The **Fault tolerance** slider (above) lets you move that
+guess-vs-refuse line to taste.
+
+### The OCR engines
+
+Choose per your priorities — speed, accuracy, offline vs. online, free vs. paid:
+
+- **Tesseract** *(default)* — local, classical OCR. No warm-up, ~0.2–0.3s per
+  scan, fully offline. The pragmatic day-to-day default.
+- **EasyOCR** — local, **deep-learning** OCR. More accurate on messy/stylised
+  game text, but pays a one-time ~15s model-load on the first scan of each run,
+  then a couple of seconds per scan. Fully offline after its one-time model
+  download. Switch to it if Tesseract keeps misreading a particular screen.
+- **Claude Vision** *(in development)* — sends the crop to Anthropic's
+  `claude-haiku-4-5` to read directly. A multimodal AI model reads the image
+  far more robustly than classical OCR on stylised text, but needs **your own
+  Anthropic API key**, an internet connection per scan, and costs a small amount
+  of money per scan.
+- **Gemini Vision** *(in development)* — the same idea via Google's
+  `gemini-2.5-flash`, using **your own Google AI Studio API key**.
+
+> The two AI-vision engines are **currently disabled in the UI** (labelled "in
+> development" — selecting one snaps back to the active engine, and their key
+> buttons are greyed out). The code paths work if you set `config.OCR_ENGINE`
+> directly and supply a key, but there's no supported UI path yet. Multi-select
+> region scanning is a known gap for them specifically — their prompt expects
+> one item per image.
+
+**Never put a real API key as a literal in `wf_pricer/config.py`** (it's tracked
+by git). Keys belong in `data/cache/anthropic_api_key.json` /
+`data/cache/google_api_key.json` (both gitignored), or the `ANTHROPIC_API_KEY` /
+`GOOGLE_API_KEY` (or `GEMINI_API_KEY`) environment variables.
+
+---
 
 ## Setup
 
-You need Python 3.11 (EasyOCR's dependencies - PyTorch in particular - don't
-reliably have prebuilt wheels for the very newest Python versions yet, so
-3.11 is the safe choice; this repo's `.venv` is already set up with it).
+You need **Python 3.11** (EasyOCR's dependencies — PyTorch in particular —
+don't reliably have prebuilt wheels for the newest Python versions yet).
 
 ```powershell
 python -m venv .venv
@@ -158,16 +290,14 @@ python -m venv .venv
 ```
 
 Tesseract (the default engine) needs a separate one-time install:
-`winget install --id UB-Mannheim.TesseractOCR -e` (already installed on this
-machine at `C:\Program Files\Tesseract-OCR`). EasyOCR is pure Python
-(pulling in PyTorch) - no separate install, but downloads its model weights
-on first use (needs internet, one-time, cached under
-`%USERPROFILE%\.EasyOCR`).
+`winget install --id UB-Mannheim.TesseractOCR -e`. EasyOCR is pure Python
+(pulling in PyTorch) — no separate install, but downloads its model weights on
+first use (one-time, cached under `%USERPROFILE%\.EasyOCR`).
 
 ## Running it
 
 ```powershell
-# with a console window, so you can see what's happening (recommended the first time)
+# with a console window (recommended the first time, so you can see what's happening)
 .venv\Scripts\python.exe run.py
 
 # silent, no console window (double-click WF-PriceTracker.bat to do the same)
@@ -175,105 +305,65 @@ on first use (needs internet, one-time, cached under
 ```
 
 The tray icon appears once the app is ready. Logs always go to
-`data/logs/app.log` regardless of which launcher you use, so if something
-seems to silently fail, check there first.
+`data/logs/app.log`, so if something seems to silently fail, check there first.
 
 ## Usage tips
 
 - **Run Warframe in Borderless Window mode**, not exclusive fullscreen.
-  Exclusive fullscreen can prevent both the global hotkeys and the screen
-  grab from working reliably; borderless window doesn't have that problem
-  and looks identical.
-- If hotkeys don't respond while Warframe has focus, try running
-  WF-PriceTracker as Administrator — some games/launchers run elevated,
-  which blocks keyboard hooks from non-elevated processes.
-- **Box size matters (Single Item mode).** Too small and the item's name
-  might get cut off (no match); too large and you might catch a neighboring
-  item's name instead. Redo "Set Item Box Size..." if scans start missing
-  or seem to return the wrong item.
-- OCR works best on screens where item names are legible as actual text
-  (Mods screen, Relics list, Prime Parts list, etc.). A pure icon with no
-  visible name text in your scan box won't match anything - that's a
-  fundamental limitation of the OCR approach, not a bug.
-- The item catalog is cached for 3 days and prices for 10 minutes
-  (`data/cache/`); the **"Refresh Item List"** button forces an immediate
-  refetch of the item catalog (e.g. right after a new item drops), bypassing
-  that 3-day cache.
-- **"Set" listings are always excluded from matching** - e.g.
-  "Wisp Prime Set" is a warframe.market trading bundle representing a full
-  collection of parts + blueprint, and never appears as its own entry in
-  your actual inventory (you only ever see the individual pieces: Barrel,
-  Stock, Chassis Blueprint, etc.), so it's never offered as a possible scan
-  match, regardless of how the catalog was loaded.
-- **Matching is two-stage, anchored on the item's base name.** Rather than
-  scoring the OCR text against all ~3,600 names at once, it first works out
-  which item *family* the text belongs to by matching each word against the
-  set of base names ("atlas", "bronco", "serration"), then ranks only that
-  family's items. The base name is the most distinctive part and usually
-  survives OCR intact, which is what keeps a garbled middle from drifting
-  to an unrelated item that merely shares generic words - e.g.
-  `wy Atlas Pfime'thassis Blueprint` correctly resolves to *Atlas Prime
-  Chassis Blueprint* instead of being dragged to "Wyrm Prime Blueprint" by
-  the shared "Prime Blueprint". Punctuation is treated as a word separator
-  too, so an OCR artifact fusing two words (`Pfime'thassis`) still splits
-  back into matchable pieces. Matching is also ~0.6 ms per lookup.
-- **If the top two candidate matches are still too close, the app refuses
-  to guess** rather than silently reporting the wrong item - e.g. OCR text
-  missing an item's part-specific last word (just "Titania Prime" instead
-  of "Titania Prime Blueprint") ties equally against every part of that
-  frame. You'll see "No item recognized" instead of a wrong price. An exact
-  read - or the same words in a different order - bypasses this, since
-  that's unambiguous. Warframe often wraps a long name across 2 lines
-  within one tile; all scan modes reconstruct that wrapped name
-  automatically, so this mostly shows up if a box/region genuinely doesn't
-  capture the full name.
-- **Scan speed depends on which engine you picked** - see the **OCR Engine**
-  section above.
-- **Grid Scan tuning.** Recalibrate ("Calibrate Grid...") whenever the
-  inventory layout or window size changes - the calibration is in absolute
-  screen pixels. If some slots come back blank, check `data/logs/app.log`
-  for the per-slot vote detail, and tune in `config.py`:
-  `GRID_BINARIZE_CUTOFF` (raise if backgrounds bleed through, lower if thin
-  strokes vanish), `GRID_SCAN_FRAMES` (more frames = better voting but
-  slower), `GRID_SCAN_MAX_RETRY_PROFILES` (how many alternative
-  preprocessing passes to try on stubborn slots). Grid Scan works with
-  Tesseract and EasyOCR; the cloud vision engines have no batch path so
-  they'd make one API call per slot (slow + costly) and aren't recommended
-  for it.
-- **An "Unreadable" label means OCR saw text but couldn't identify it**, even
-  after all the retry profiles - the window log shows the best text it
-  managed, which usually points at the cause (name cut off by the band, a
-  badge bleeding in, or a faded/not-owned item). A slot with no label at all
-  simply had no text.
-- **Calibrate the grid band tightly around JUST the name text**, not the
-  whole tile. If the band reaches up into the icon, it can catch the game's
-  own `✓`/quantity badge on owned items (a stray "✓2" reads as garbage that
-  ties the item against its family and gets it dropped). A snug band around
-  the name label avoids that.
-- **Faded / not-owned items** (shown ghosted in the inventory) have dim name
-  text that OCR often can't read cleanly, so they may not get a price - not
-  much to do about that short of the AI-vision engines.
-- **The app hides itself during every scan.** Our result labels, grid
-  outline, and the app window all sit on top of the game, so before each
-  screen grab they're withdrawn for a split second and restored right after
-  (otherwise the scan would read its own labels/window text as items - which
-  is exactly what a stale label drawn over an item name would corrupt on a
-  re-scan). You may see a brief flicker; that's intentional. Global hotkeys
-  keep working while it's hidden.
+  Exclusive fullscreen can block the global hotkeys, the screen grab, and the
+  quick-search focus; borderless window looks identical and avoids all of it.
+- If hotkeys don't respond while Warframe has focus, try running WF-PriceTracker
+  **as Administrator** — some launchers run elevated, which blocks keyboard
+  hooks from non-elevated processes.
+- **"Set" listings are always excluded from scan matching** (e.g. "Wisp Prime
+  Set" is a trading-bundle listing, never a real inventory entry — you only ever
+  hold the individual pieces). *Manual search does include Sets*, since you
+  might genuinely want to price the full bundle.
+- OCR works best where item names are legible text (Mods, Relics, Prime Parts
+  screens). See the OCR section above for the limits.
+- The item catalog is cached for 3 days, prices for 10 minutes (`data/cache/`).
+- **Calibrate the Grid band tightly around JUST the name text**, not the whole
+  tile, so it doesn't catch the game's `✓`/quantity badge on owned items.
+  Recalibrate whenever the inventory layout or window size changes.
+- **The app hides itself during every scan** — its labels/outline/window all sit
+  over the game, so they're withdrawn for a split second before each grab and
+  restored right after (otherwise a scan would read its own labels as items).
+  The brief flicker is intentional; global hotkeys keep working while hidden.
+
+---
+
+## Status — a passion project
+
+To be clear about what this is: **a passion project.** It exists only because
+Warframe offers no official, public way to read your own inventory
+programmatically — so screen-reading with OCR is the polite, non-invasive
+workaround, warts and all.
+
+The day Warframe (Digital Extremes) publicises an API or service to get
+inventory details properly, I'll happily retire this — and either just **use
+whatever official app that enables, or build another one, properly this time**,
+on top of real data instead of pixels. Until then, this scratches the itch
+without hooking into anything it shouldn't.
+
+---
 
 ## Project layout
 
 ```
 wf_pricer/
-  config.py     settings: hotkeys, folders, box size, grid calibration, selection mode, OCR engine + API key storage
-  scan.py       screen grabs (cursor box / region / multi-frame), global hotkeys, cursor tracking, drag-select watcher
-  ocr.py        Tesseract / EasyOCR / Claude / Gemini engines + name-band preprocessing profiles & montage reader
-  items_db.py   catalog fetch/cache + two-stage anchored matching (base-name families, excludes Sets, refuses ties)
-  market.py     warframe.market order fetch/cache (thread-safe) + concurrent get_prices + price averaging
-  pipeline.py   price_crop (single) / price_region (multi) / price_grid (grid, retries + UNREADABLE) - concurrent pricing
-  gui.py        app window + overlays (calibration, cursor box, grid outline, multi-result labels, result popup)
+  config.py     settings: hotkeys, folders, box size, grid calibration, selection mode,
+                OCR engine, match tolerance, price threads, API key storage
+  scan.py       screen grabs, global hotkeys, cursor tracking, drag-select watcher,
+                Windows foreground-focus helper (for the quick-search popup)
+  ocr.py        Tesseract / EasyOCR / Claude / Gemini engines + name-band preprocessing
+  items_db.py   catalog fetch/cache + two-stage anchored fuzzy matching (excludes Sets,
+                refuses ambiguous ties) + full-catalog search index
+  market.py     warframe.market order fetch/cache (thread-safe), concurrent pricing,
+                per-item stats (order book, per-rank tiers, 48h volume)
+  pipeline.py   price_crop (single) / price_region (multi) / price_grid (grid)
+  gui.py        tabbed window, dark theme, overlays, quick-search + stats popups
   tray.py       tray icon image
-  main.py       app entry point (window + tray + hotkeys wiring, all three selection modes)
+  main.py       app entry point (window + tray + hotkeys wiring)
 run.py / run.pyw  launchers (console / silent)
 data/           cache, logs (all gitignored)
 ```

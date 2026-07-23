@@ -18,7 +18,7 @@ from typing import Callable
 from pynput import keyboard, mouse
 
 from . import config
-from .scan import virtual_screen_rect
+from .scan import force_foreground, primary_screen_size, virtual_screen_rect
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +107,23 @@ def _hk_key_token(key) -> str | None:
     return f"<{vk}>" if vk is not None else None
 
 
+def _autocomplete(index: list, text: str, limit: int = 8) -> list[tuple[str, str]]:
+    """Up to `limit` (name, slug) matches for `text` against a catalog of
+    (name, slug, lowercased-name) rows: names that START with it first, then
+    names that merely contain it. Shared by the inline and quick search."""
+    text = text.lower()
+    starts: list[tuple[str, str]] = []
+    contains: list[tuple[str, str]] = []
+    for name, slug, low in index:
+        if low.startswith(text):
+            starts.append((name, slug))
+            if len(starts) >= limit:
+                break
+        elif text in low:
+            contains.append((name, slug))
+    return (starts + contains)[:limit]
+
+
 class AppWindow:
     _ENGINE_OPTIONS = [
         ("easyocr", "EasyOCR (accurate, slower)"),
@@ -137,8 +154,10 @@ class AppWindow:
         on_selection_mode_change: Callable[[str], None],
         on_calibrate_grid: Callable[[], None],
         on_price_workers_change: Callable[[int], None],
+        on_match_tolerance_change: Callable[[int], None],
         on_set_hotkey: Callable[[str, str], None],
         on_hotkey_capture_start: Callable[[], None],
+        on_lookup_item: Callable[[str, str], None],
         on_quit: Callable[[], None],
     ) -> None:
         self._log_queue: "queue.Queue[str]" = queue.Queue()
@@ -162,6 +181,8 @@ class AppWindow:
         self.selection_mode_var = tk.StringVar(value="single")
         self.price_workers_var = tk.IntVar(value=1)
         self.price_workers_label_var = tk.StringVar(value="")
+        self.match_cutoff_var = tk.IntVar(value=config.FUZZY_MATCH_SCORE_CUTOFF)
+        self.match_tolerance_label_var = tk.StringVar(value="")
         self._current_engine_key = "tesseract"
         self._tabs: dict[str, tuple[tk.Label, tk.Frame]] = {}
         self._panels: dict[str, tk.Frame] = {}
@@ -178,10 +199,18 @@ class AppWindow:
             "scan": hotkey_label(config.HOTKEY_SCAN),
             "toggle": hotkey_label(config.HOTKEY_TOGGLE_SCAN),
             "quit": hotkey_label(config.HOTKEY_QUIT),
+            "search": hotkey_label(config.HOTKEY_SEARCH),
         }
         self._hk_vars = {k: tk.StringVar(value=v) for k, v in self._hk_labels.items()}
         self._scan_active = False
         self._result_popup: "ResultPopup | None" = None
+        # Manual item search (magnifier button in the header).
+        self._search_visible = False
+        self._search_index: list[tuple[str, str, str]] = []  # (name, slug, lowercased name)
+        self._suggest_win: tk.Toplevel | None = None
+        self._suggestions: list[tuple[str, str]] = []  # (name, slug) currently shown
+        self._sugg_index = -1
+        self._quick_search: "QuickSearchPopup | None" = None  # the hotkey pop-up
 
         self._on_toggle_scan = on_toggle_scan
         self._on_scan_now = on_scan_now
@@ -193,8 +222,10 @@ class AppWindow:
         self._on_selection_mode_change = on_selection_mode_change
         self._on_calibrate_grid = on_calibrate_grid
         self._on_price_workers_change = on_price_workers_change
+        self._on_match_tolerance_change = on_match_tolerance_change
         self._on_set_hotkey = on_set_hotkey
         self._on_hotkey_capture_start = on_hotkey_capture_start
+        self._on_lookup_item = on_lookup_item
         self._on_quit = on_quit
 
         self._init_style()
@@ -330,10 +361,14 @@ class AppWindow:
 
         self._build_header(content)
         self._build_tab_bar(content)
+        self._build_search(content)
         self._build_mode_panels(content)
         self._build_actions(content)
         self._build_log(content)
         self._apply_active_tab(self._active_tab)
+        # Click-away closes the autocomplete dropdown (add="+" so it coexists
+        # with the mouse-wheel binding on the scroll area).
+        self.root.bind("<Button-1>", self._on_root_click, add="+")
 
     # --- scroll area ------------------------------------------------------
     def _build_scroll_area(self, parent: tk.Misc) -> tk.Frame:
@@ -440,6 +475,21 @@ class AppWindow:
             header, text="WF-PriceTracker", bg=BG, fg=TEXT, font=(FONT, 15, "bold")
         ).pack(side="left")
 
+        # Magnifier button, just right of the title, opens the manual search;
+        # its hotkey is shown alongside so the shortcut is discoverable.
+        self._search_btn = tk.Canvas(header, width=26, height=26, bg=BG, highlightthickness=0, cursor="hand2")
+        self._render_search_icon(False)
+        self._search_btn.pack(side="left", padx=(10, 0))
+        self._search_btn.bind("<Button-1>", lambda _e: self._toggle_search())
+        self._search_btn.bind("<Enter>", lambda _e: self._render_search_icon(True))
+        self._search_btn.bind("<Leave>", lambda _e: self._render_search_icon(False))
+        search_hint = tk.Label(
+            header, textvariable=self._hk_vars["search"], bg=BG, fg=TEXT_DIM,
+            font=(FONT, 8), cursor="hand2",
+        )
+        search_hint.pack(side="left", padx=(4, 0))
+        search_hint.bind("<Button-1>", lambda _e: self._toggle_search())
+
         # Status reads as a pill: a coloured dot plus the text, so scan state
         # is legible at a glance from across the screen.
         pill = tk.Frame(header, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
@@ -457,6 +507,7 @@ class AppWindow:
         """
         bar = tk.Frame(parent, bg=BG)
         bar.pack(fill="x", padx=16)
+        self._tab_bar_frame = bar  # the search bar packs just above this
         for key, label in self._TAB_DEFS:
             holder = tk.Frame(bar, bg=BG)
             holder.pack(side="left", expand=True, fill="x")
@@ -474,6 +525,158 @@ class AppWindow:
             tab.bind("<Enter>", lambda _e, k=key: self._on_tab_hover(k, True))
             tab.bind("<Leave>", lambda _e, k=key: self._on_tab_hover(k, False))
             self._tabs[key] = (tab, underline)
+
+    # --- manual item search -----------------------------------------------
+    def _render_search_icon(self, hover: bool) -> None:
+        """(Re)draw the magnifier: a ring + handle, accent when hovered or the
+        search bar is open, dim otherwise. Drawn rather than an emoji/font
+        glyph so it renders crisply and in the theme colour everywhere."""
+        color = ACCENT if (hover or self._search_visible) else TEXT_DIM
+        cv = self._search_btn
+        cv.delete("all")
+        cv.create_oval(5, 5, 17, 17, outline=color, width=2)
+        cv.create_line(16, 16, 22, 22, fill=color, width=2, capstyle="round")
+
+    def _build_search(self, parent: tk.Misc) -> None:
+        # Built now but packed only while open (see _open_search), just above
+        # the tab strip. The autocomplete dropdown is a separate Toplevel so it
+        # floats over the content instead of shoving the tabs around.
+        self._search_frame = tk.Frame(parent, bg=BG)
+        box = tk.Frame(self._search_frame, bg=SURFACE_HI, highlightbackground=BORDER, highlightthickness=1)
+        box.pack(fill="x")
+        self._search_entry = tk.Entry(
+            box, bg=SURFACE_HI, fg=TEXT, insertbackground=TEXT,
+            relief="flat", bd=0, highlightthickness=0, font=(FONT, 11),
+        )
+        self._search_entry.pack(side="left", fill="x", expand=True, padx=(10, 6), pady=8)
+        clear = tk.Label(box, text="✕", bg=SURFACE_HI, fg=TEXT_DIM, cursor="hand2", font=(FONT, 10))
+        clear.pack(side="right", padx=(0, 10))
+        clear.bind("<Button-1>", lambda _e: self._close_search())
+
+        self._search_entry.bind("<KeyRelease>", self._on_search_key)
+        self._search_entry.bind("<Return>", lambda _e: self._submit_search())
+        self._search_entry.bind("<Down>", lambda _e: self._move_suggestion(1))
+        self._search_entry.bind("<Up>", lambda _e: self._move_suggestion(-1))
+        self._search_entry.bind("<Escape>", lambda _e: self._close_search())
+
+    def _toggle_search(self) -> None:
+        self._close_search() if self._search_visible else self._open_search()
+
+    def _open_search(self) -> None:
+        self._search_frame.pack(fill="x", padx=16, pady=(10, 0), before=self._tab_bar_frame)
+        self._search_visible = True
+        self._render_search_icon(True)
+        self._search_entry.focus_set()
+        self._schedule_reflow()
+
+    def _close_search(self) -> None:
+        self._hide_suggestions()
+        self._search_entry.delete(0, "end")
+        self._search_frame.pack_forget()
+        self._search_visible = False
+        self._render_search_icon(False)
+        self._schedule_reflow()
+
+    def _match_names(self, text: str) -> list[tuple[str, str]]:
+        return _autocomplete(self._search_index, text)
+
+    def _on_search_key(self, event: tk.Event) -> None:
+        if event.keysym in ("Down", "Up", "Return", "Escape", "Left", "Right"):
+            return  # navigation / submit handled by their own bindings
+        text = self._search_entry.get().strip().lower()
+        if not text or not self._search_index:
+            self._hide_suggestions()
+            return
+        self._show_suggestions(self._match_names(text))
+
+    def _show_suggestions(self, items: list[tuple[str, str]]) -> None:
+        self._suggestions = items
+        self._sugg_index = -1
+        if not items:
+            self._hide_suggestions()
+            return
+        if self._suggest_win is None:
+            self._suggest_win = tk.Toplevel(self.root)
+            self._suggest_win.overrideredirect(True)
+            self._suggest_win.attributes("-topmost", True)
+            self._suggest_list = tk.Listbox(
+                self._suggest_win, activestyle="none", bg=SURFACE_HI, fg=TEXT,
+                selectbackground=ACCENT_DIM, selectforeground=TEXT, relief="flat", bd=0,
+                highlightthickness=1, highlightbackground=BORDER, font=(FONT, 10),
+            )
+            self._suggest_list.pack(fill="both", expand=True)
+            self._suggest_list.bind("<ButtonRelease-1>", lambda _e: self._pick_clicked())
+        lb = self._suggest_list
+        lb.delete(0, "end")
+        for name, _slug in items:
+            lb.insert("end", name)
+        lb.config(height=len(items))
+        # Anchor the dropdown to the entry's on-screen position and width.
+        self.root.update_idletasks()
+        e = self._search_entry
+        x, y = e.winfo_rootx(), e.winfo_rooty() + e.winfo_height() + 3
+        self._suggest_win.geometry(f"{e.winfo_width()}x{self._suggest_win.winfo_reqheight()}+{x}+{y}")
+        self._suggest_win.deiconify()
+        self._suggest_win.lift()
+
+    def _hide_suggestions(self) -> None:
+        self._suggestions = []
+        self._sugg_index = -1
+        if self._suggest_win is not None:
+            self._suggest_win.withdraw()
+
+    def _move_suggestion(self, delta: int) -> object:
+        # Keyboard nav keeps focus in the entry and just moves the highlight,
+        # sidestepping all the focus juggling a focusable dropdown would need.
+        if self._suggest_win is None or not self._suggest_win.winfo_viewable() or not self._suggestions:
+            return None
+        n = len(self._suggestions)
+        self._sugg_index = max(0, min(n - 1, self._sugg_index + delta))
+        self._suggest_list.selection_clear(0, "end")
+        self._suggest_list.selection_set(self._sugg_index)
+        self._suggest_list.see(self._sugg_index)
+        return "break"
+
+    def _resolve(self, text: str) -> tuple[str | None, str | None]:
+        low = text.lower()
+        for name, slug, l in self._search_index:
+            if l == low:
+                return name, slug
+        matches = self._match_names(low)
+        return matches[0] if matches else (None, None)
+
+    def _submit_search(self) -> None:
+        text = self._search_entry.get().strip()
+        if not text:
+            return
+        if 0 <= self._sugg_index < len(self._suggestions):
+            name, slug = self._suggestions[self._sugg_index]  # a highlighted suggestion wins
+        else:
+            name, slug = self._resolve(text)
+        if slug is None:
+            self.log(f'No item found for "{text}".')
+            return
+        self._search_entry.delete(0, "end")
+        self._search_entry.insert(0, name)
+        self._hide_suggestions()
+        self._on_lookup_item(slug, name)
+
+    def _pick_clicked(self) -> None:
+        sel = self._suggest_list.curselection()
+        if not sel:
+            return
+        name, slug = self._suggestions[sel[0]]
+        self._search_entry.delete(0, "end")
+        self._search_entry.insert(0, name)
+        self._hide_suggestions()
+        self._on_lookup_item(slug, name)
+
+    def _on_root_click(self, event: tk.Event) -> None:
+        if self._suggest_win is None or not self._suggest_win.winfo_viewable():
+            return
+        if event.widget is self._search_entry or event.widget is self._suggest_list:
+            return
+        self._hide_suggestions()
 
     def _build_mode_panels(self, parent: tk.Misc) -> None:
         """One card per mode, holding ONLY that mode's own settings. Exactly
@@ -562,7 +765,10 @@ class AppWindow:
     def _scan_btn_text(self) -> str:
         return f"Scan Now ({self._hk_labels['scan']})"
 
-    _HK_ACTION_NAMES = {"toggle": "Toggle scan mode", "scan": "Scan now", "quit": "Quit app"}
+    _HK_ACTION_NAMES = {
+        "toggle": "Toggle scan mode", "scan": "Scan now",
+        "search": "Open search", "quit": "Quit app",
+    }
 
     def _settings_subhead(self, parent: tk.Misc, text: str, first: bool = False) -> None:
         """A divider + small caps heading to group the settings card into
@@ -608,9 +814,35 @@ class AppWindow:
         speed_hint.pack(fill="x", pady=(4, 0))
         self._wrap_labels.append((speed_hint, 64))
 
+        # --- Matching tolerance ---
+        self._settings_subhead(body, "Matching")
+        tk.Label(
+            body, textvariable=self.match_tolerance_label_var,
+            bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9),
+        ).pack(anchor="w")
+        # from_ > to_ so dragging RIGHT lowers the cutoff, i.e. raises
+        # tolerance. The raw value is the score cutoff; the label shows it as a
+        # tolerance percentage (see _update_match_tolerance_label).
+        self.match_tolerance_scale = ttk.Scale(
+            body,
+            from_=config.FUZZY_MATCH_SCORE_CUTOFF_MAX,
+            to=config.FUZZY_MATCH_SCORE_CUTOFF_MIN,
+            orient="horizontal", style="Accent.Horizontal.TScale",
+            command=self._on_match_tolerance_scale,
+        )
+        self.match_tolerance_scale.pack(fill="x", pady=(4, 0))
+        match_hint = tk.Label(
+            body,
+            text="Higher tolerance guesses on messy reads; lower reports 'unmatched' "
+                 "instead of risking a wrong item.",
+            bg=SURFACE, fg=TEXT_DIM, font=(FONT, 8), wraplength=430, justify="left", anchor="w",
+        )
+        match_hint.pack(fill="x", pady=(4, 0))
+        self._wrap_labels.append((match_hint, 64))
+
         # --- Hotkeys ---
         self._settings_subhead(body, "Hotkeys")
-        for action in ("toggle", "scan", "quit"):
+        for action in ("toggle", "scan", "search", "quit"):
             self._hotkey_row(body, action)
 
         # --- Catalog / keys ---
@@ -795,6 +1027,33 @@ class AppWindow:
 
         self.call_soon(_set)
 
+    def _on_match_tolerance_scale(self, raw: str) -> None:
+        # The raw scale value IS the score cutoff; snap it and only fire the
+        # persist callback when the integer cutoff actually changes.
+        cutoff = int(round(float(raw)))
+        self._update_match_tolerance_label(cutoff)
+        if cutoff != self.match_cutoff_var.get():
+            self.match_cutoff_var.set(cutoff)
+            self._on_match_tolerance_change(cutoff)
+
+    def _update_match_tolerance_label(self, cutoff: int) -> None:
+        span = config.FUZZY_MATCH_SCORE_CUTOFF_MAX - config.FUZZY_MATCH_SCORE_CUTOFF_MIN
+        # Present the cutoff as leniency: a low cutoff = high tolerance.
+        tol = round((config.FUZZY_MATCH_SCORE_CUTOFF_MAX - cutoff) / span * 100) if span else 0
+        word = "strict" if tol < 25 else ("balanced" if tol < 60 else "lenient")
+        self.match_tolerance_label_var.set(f"Fault tolerance: {tol}% ({word})")
+
+    def set_match_tolerance(self, cutoff: int) -> None:
+        """Reflects the persisted match cutoff at startup without firing the
+        change callback. Thread-safe."""
+
+        def _set() -> None:
+            self.match_cutoff_var.set(cutoff)
+            self.match_tolerance_scale.set(cutoff)
+            self._update_match_tolerance_label(cutoff)
+
+        self.call_soon(_set)
+
     def _on_engine_selected(self, _event: object = None) -> None:
         label = self.engine_var.get()
         for key, lbl in self._ENGINE_OPTIONS:
@@ -929,6 +1188,36 @@ class AppWindow:
         (and never lingers into the next scan's screen grab). Thread-safe.
         """
         self.call_soon(self._destroy_result_popup)
+
+    def set_search_catalog(self, entries: list[tuple[str, str]]) -> None:
+        """Feed the search box its (name, slug) catalog for autocomplete.
+        Called once the item catalog has loaded/refreshed. Thread-safe."""
+
+        def _set() -> None:
+            self._search_index = [(name, slug, name.lower()) for name, slug in entries]
+
+        self.call_soon(_set)
+
+    def open_search(self) -> None:
+        """Fired by the global search hotkey: pop a small, already-focused
+        search bar (NOT the whole app) so you can type and hit Enter straight
+        away. Thread-safe."""
+
+        def _do() -> None:
+            if self._quick_search is not None and self._quick_search.winfo_exists():
+                self._quick_search.reactivate()  # already open - just refocus
+                return
+            self._quick_search = QuickSearchPopup(
+                self.root, self._search_index, self._on_lookup_item,
+            )
+
+        self.call_soon(_do)
+
+    def show_item_stats(self, name: str, lines: list[tuple[str, str]] | None) -> None:
+        """Pop up the market-stats window for a searched item. `lines` is a
+        list of (label, value) rows, or None when nothing could be fetched.
+        Thread-safe."""
+        self.call_soon(lambda: ItemStatsPopup(self.root, name, lines))
 
     def _destroy_result_popup(self) -> None:
         if self._result_popup is not None:
@@ -1657,6 +1946,224 @@ class HotkeyCaptureDialog(tk.Toplevel):
             self.grab_release()
         except tk.TclError:
             pass
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
+class ItemStatsPopup(tk.Toplevel):
+    """A small, centred, dismissable window showing one item's market stats
+    (from a manual search): 48h volume/avg/median/range plus the current sell
+    book. `lines` is a list of (label, value) rows, or None when nothing could
+    be fetched. Closed by the ✕, Escape, or clicking outside is not required -
+    it stays put so the numbers can be read."""
+
+    def __init__(self, parent: tk.Misc, name: str, lines: list[tuple[str, str]] | None) -> None:
+        super().__init__(parent)
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-alpha", 0.98)
+        except tk.TclError:
+            pass
+
+        border = tk.Frame(self, bg=BORDER)  # 1px hairline frame
+        border.pack(fill="both", expand=True)
+        card = tk.Frame(border, bg=SURFACE)
+        card.pack(fill="both", expand=True, padx=1, pady=1)
+
+        head = tk.Frame(card, bg=SURFACE)
+        head.pack(fill="x", padx=14, pady=(12, 8))
+        tk.Label(head, text=name, bg=SURFACE, fg=ACCENT, font=(FONT, 12, "bold")).pack(side="left")
+        close = tk.Label(head, text="✕", bg=SURFACE, fg=TEXT_DIM, cursor="hand2", font=(FONT, 11))
+        close.pack(side="right", padx=(16, 0))
+        close.bind("<Button-1>", lambda _e: self._safe_destroy())
+
+        tk.Frame(card, bg=BORDER, height=1).pack(fill="x", padx=14)
+
+        body = tk.Frame(card, bg=SURFACE)
+        body.pack(fill="both", expand=True, padx=14, pady=(8, 12))
+        if not lines:
+            tk.Label(
+                body, text="No market data available for this item.",
+                bg=SURFACE, fg=TEXT_DIM, font=(FONT, 10), wraplength=240, justify="left",
+            ).pack(anchor="w")
+        else:
+            for label, value in lines:
+                row = tk.Frame(body, bg=SURFACE)
+                row.pack(fill="x", pady=3)
+                tk.Label(row, text=label, bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9)).pack(side="left")
+                tk.Label(row, text=value, bg=SURFACE, fg=TEXT, font=(FONT, 10, "bold")).pack(side="right")
+
+        # Centre on the primary monitor, not the (possibly hidden/behind-game)
+        # main window, since this can be triggered by the hotkey search while
+        # in-game. Grab foreground too - it appears after a network delay, by
+        # which point focus may have returned to the game.
+        self.update_idletasks()
+        w, h = max(self.winfo_reqwidth(), 240), self.winfo_reqheight()
+        sw, sh = primary_screen_size()
+        self.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+
+        self.bind("<Escape>", lambda _e: self._safe_destroy())
+        self.lift()
+        force_foreground(self)
+        self.focus_force()
+
+    def _safe_destroy(self) -> None:
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
+class QuickSearchPopup(tk.Toplevel):
+    """A standalone, auto-focused search bar shown by the global search hotkey.
+
+    Unlike the inline header search, this doesn't raise the whole app - it's a
+    small floating bar centred on screen that grabs keyboard focus immediately
+    (see scan.force_foreground), so you can type an item name, press Enter, and
+    get the stats popup without ever clicking. Esc or clicking away closes it.
+    """
+
+    _WIDTH = 380
+
+    def __init__(self, parent: tk.Misc, catalog: list, on_lookup: Callable[[str, str], None]) -> None:
+        super().__init__(parent)
+        self._catalog = catalog  # (name, slug, lowercased-name) rows
+        self._on_lookup = on_lookup
+        self._suggestions: list[tuple[str, str]] = []
+        self._sugg_index = -1
+        self._ready = False  # suppresses focus-out close during the focus grab
+
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+
+        border = tk.Frame(self, bg=ACCENT)  # accent edge signals "typing here"
+        border.pack(fill="both", expand=True)
+        card = tk.Frame(border, bg=SURFACE_HI)
+        card.pack(fill="both", expand=True, padx=2, pady=2)
+
+        row = tk.Frame(card, bg=SURFACE_HI)
+        row.pack(fill="x")
+        icon = tk.Canvas(row, width=26, height=26, bg=SURFACE_HI, highlightthickness=0)
+        icon.create_oval(6, 6, 18, 18, outline=ACCENT, width=2)
+        icon.create_line(17, 17, 23, 23, fill=ACCENT, width=2, capstyle="round")
+        icon.pack(side="left", padx=(12, 6), pady=10)
+        self._entry = tk.Entry(
+            row, bg=SURFACE_HI, fg=TEXT, insertbackground=ACCENT,
+            relief="flat", bd=0, highlightthickness=0, font=(FONT, 14),
+        )
+        self._entry.pack(side="left", fill="x", expand=True, padx=(0, 12), pady=10)
+
+        self._list = tk.Listbox(
+            card, activestyle="none", bg=SURFACE, fg=TEXT,
+            selectbackground=ACCENT_DIM, selectforeground=TEXT, relief="flat", bd=0,
+            highlightthickness=0, font=(FONT, 10),
+        )
+        self._list.bind("<ButtonRelease-1>", lambda _e: self._pick_clicked())
+
+        self._entry.bind("<KeyRelease>", self._on_key)
+        self._entry.bind("<Return>", lambda _e: self._submit())
+        self._entry.bind("<Down>", lambda _e: self._move(1))
+        self._entry.bind("<Up>", lambda _e: self._move(-1))
+        self._entry.bind("<Escape>", lambda _e: self._close())
+        self.bind("<FocusOut>", lambda _e: self.after(1, self._maybe_close))
+
+        self._place()
+        self.lift()
+        force_foreground(self)
+        self._entry.focus_force()
+        # Windows sometimes hands focus over a beat late; re-assert once, then
+        # arm the click-away close so startup focus churn can't self-dismiss it.
+        self.after(40, self._entry.focus_force)
+        self.after(300, lambda: setattr(self, "_ready", True))
+
+    def reactivate(self) -> None:
+        """Re-focus an already-open bar (search hotkey pressed again)."""
+        self.lift()
+        force_foreground(self)
+        self._entry.focus_force()
+
+    def _place(self) -> None:
+        self.update_idletasks()
+        h = self.winfo_reqheight()
+        sw, sh = primary_screen_size()
+        x = max(0, (sw - self._WIDTH) // 2)
+        y = max(0, sh // 4)  # upper third, launcher-style
+        self.geometry(f"{self._WIDTH}x{h}+{x}+{y}")
+
+    # --- autocomplete ---
+    def _on_key(self, event: tk.Event) -> None:
+        if event.keysym in ("Down", "Up", "Return", "Escape", "Left", "Right"):
+            return
+        text = self._entry.get().strip()
+        self._set_suggestions(_autocomplete(self._catalog, text) if text else [])
+
+    def _set_suggestions(self, items: list[tuple[str, str]]) -> None:
+        self._suggestions = items
+        self._sugg_index = -1
+        if not items:
+            self._list.pack_forget()
+        else:
+            self._list.delete(0, "end")
+            for name, _slug in items:
+                self._list.insert("end", name)
+            self._list.config(height=len(items))
+            if not self._list.winfo_manager():
+                self._list.pack(fill="x", padx=2, pady=(0, 2))
+        self._place()
+
+    def _move(self, delta: int) -> object:
+        if not self._suggestions:
+            return "break"
+        self._sugg_index = max(0, min(len(self._suggestions) - 1, self._sugg_index + delta))
+        self._list.selection_clear(0, "end")
+        self._list.selection_set(self._sugg_index)
+        self._list.see(self._sugg_index)
+        return "break"
+
+    def _resolve(self, text: str) -> tuple[str | None, str | None]:
+        low = text.lower()
+        for name, slug, l in self._catalog:
+            if l == low:
+                return name, slug
+        matches = _autocomplete(self._catalog, low)
+        return matches[0] if matches else (None, None)
+
+    def _submit(self) -> None:
+        text = self._entry.get().strip()
+        if not text:
+            return
+        if 0 <= self._sugg_index < len(self._suggestions):
+            name, slug = self._suggestions[self._sugg_index]
+        else:
+            name, slug = self._resolve(text)
+        if slug is None:
+            return  # no match - leave the bar open to keep typing
+        self._close()
+        self._on_lookup(slug, name)
+
+    def _pick_clicked(self) -> None:
+        sel = self._list.curselection()
+        if not sel:
+            return
+        name, slug = self._suggestions[sel[0]]
+        self._close()
+        self._on_lookup(slug, name)
+
+    def _maybe_close(self) -> None:
+        # Close once focus has left the whole app (clicked away / alt-tabbed),
+        # but not for focus moving to our own listbox, and not during startup.
+        if not self._ready:
+            return
+        try:
+            if self.focus_get() is None:
+                self._close()
+        except (tk.TclError, KeyError):
+            pass
+
+    def _close(self) -> None:
         try:
             self.destroy()
         except tk.TclError:
