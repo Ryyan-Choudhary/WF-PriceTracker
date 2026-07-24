@@ -1,11 +1,10 @@
 """Turns a screen crop into priced item(s).
 
-price_crop() is for single-item scans: OCR the crop, fuzzy-match the best
-line (or the whole crop's lines joined together, if the name wrapped) and
-price it.
-
 price_region() is for multi-select scans: OCR a larger region that may
 contain several different items' tiles, and price every one found.
+
+price_relic() is for Relic Reward mode: read the up-to-4 reward names on the
+Void Fissure reward-selection screen and price them (see relic_reward_rect).
 
 price_grid() is for Grid Scan mode: a calibrated R x C grid of slots, each
 slot's name band OCR'd and voted across several captured frames.
@@ -19,67 +18,10 @@ from typing import Callable, Optional
 
 from PIL import Image
 
-from . import config, market, ocr
+from . import config, market, ocr, segment
 from .items_db import ItemsIndex
 
 log = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class ScanResult:
-    name: str
-    slug: str
-    price: market.PriceEstimate
-    raw_text: str  # the OCR line that produced this match - handy for diagnosing a wrong match
-
-
-def price_crop(image: Image.Image, items_index: ItemsIndex) -> tuple[ScanResult | None, list[str]]:
-    """Returns (result, raw_ocr_lines). raw_ocr_lines is every line of text
-    the OCR engine actually saw in the crop, regardless of whether any of
-    it matched - if a scan matches the wrong item (or nothing at all),
-    seeing exactly what the engine read is what actually explains why.
-    """
-    lines = ocr.extract_lines(image)
-    raw_texts = [line.text for line in lines]
-
-    # Warframe's own UI wraps a long item name across 2+ lines within one
-    # tile (e.g. "Titania Prime" / "Blueprint"), so OCR reports them as
-    # separate lines. Matching each line alone means the matcher never sees
-    # the full name - "Titania Prime" alone is genuinely ambiguous (every
-    # part of that frame shares it), while the complete "Titania Prime
-    # Blueprint" is not. Try the whole crop's text joined together first (in
-    # top-to-bottom reading order), then fall back to each line alone.
-    candidates: list[str] = []
-    if len(lines) > 1:
-        ordered = sorted(lines, key=lambda l: l.bbox[1])
-        # Stop joining at the first big vertical gap. Even a single-item scan
-        # box can clip the tile below, and gluing that tile's name on turns a
-        # readable name into an unmatchable run-on. A gap wider than the line
-        # itself is tall means a new tile, not a wrapped continuation.
-        joined_parts = [ordered[0].text]
-        for prev, line in zip(ordered, ordered[1:]):
-            if line.bbox[1] - (prev.bbox[1] + prev.bbox[3]) > prev.bbox[3]:
-                break
-            joined_parts.append(line.text)
-        if len(joined_parts) > 1:
-            candidates.append(" ".join(joined_parts))
-    candidates.extend(line.text for line in lines)
-
-    # A single-line join is just that line again, and OCR can repeat a line
-    # verbatim; matching is the expensive step here, so don't redo it.
-    for candidate_text in dict.fromkeys(candidates):
-        item = items_index.match(candidate_text)
-        if item is None:
-            continue
-        price = market.get_price(item.slug)
-        if not price.has_data:
-            continue  # matched a real item name but no live sell orders to price it with
-        log.info(
-            "Scan matched %s (%s) -> %.1fp avg (raw OCR: %r)", item.name, item.slug, price.avg_platinum, candidate_text
-        )
-        return ScanResult(name=item.name, slug=item.slug, price=price, raw_text=candidate_text), raw_texts
-
-    return None, raw_texts
 
 
 @dataclass(frozen=True)
@@ -88,6 +30,38 @@ class RegionMatch:
     slug: str
     price: market.PriceEstimate
     bbox: tuple[int, int, int, int]  # position within the captured region (not the screen)
+
+
+def _identify_region_items(
+    image: Image.Image, items_index: ItemsIndex
+) -> list[tuple[object, tuple[int, int, int, int]]]:
+    """OCR a multi-item region, group the lines into per-item clusters, and
+    return (item, region-local bbox) for every cluster that matches the catalog.
+
+    The grouping (segment.cluster_lines) is the fix for the old "pair the line
+    directly below if the left edges align" heuristic, which broke on
+    Warframe's CENTRED wrap lines: "Volt Prime" over a narrower, offset
+    "Blueprint" wouldn't pair, so each half was matched alone - "Volt Prime"
+    ties across every Volt part (refused, or worse, guessed) and "Blueprint"
+    matches nothing, i.e. the two-prices-for-one-slot / no-match symptoms.
+    Clustering merges vertically-adjacent, horizontally-overlapping lines (the
+    centred-wrap case) while never joining two different columns, so each
+    item's full name is assembled once and matched once.
+    """
+    lines = ocr.extract_lines(image, sparse=True)
+    clusters = segment.cluster_lines(lines)
+
+    identified: list[tuple[object, tuple[int, int, int, int]]] = []
+    for cluster in clusters:
+        item = items_index.match(cluster.text)
+        if item is not None:
+            identified.append((item, cluster.bbox))
+
+    # Safety net: never emit two items for the same on-screen spot. If two
+    # matches' boxes overlap, keep the one with the longer (more specific) name.
+    return segment.dedup_by_bbox(
+        identified, priority=lambda item, _bbox: len(getattr(item, "name", ""))
+    )
 
 
 def price_region(
@@ -99,74 +73,52 @@ def price_region(
     user-dragged multi-select box spanning several inventory tiles), and
     prices every one found.
 
-    Unlike price_crop (which assumes every line belongs to ONE item's name
-    and is safe to join wholesale), lines here can belong to entirely
-    different items, so a line is only combined with another if that other
-    line sits directly below it and roughly horizontally aligned (small
-    vertical gap, similar left edge) - not just whichever line happens to
-    come next in reading order, which for a multi-column grid is usually
-    the next item along the SAME row, not the row below. This handles
-    Warframe's habit of wrapping a long name across 2 lines within one tile
-    without merging two different tiles' names together.
-
-    Prices are fetched concurrently (see market.get_prices) since that's the
-    slow part; on_match(match) fires as each item's price resolves, so a
-    caller can update a live on-screen overlay incrementally.
+    Lines are grouped into per-item clusters (see _identify_region_items) so a
+    name wrapped across two centred lines is assembled into one match rather
+    than split into two, and prices are fetched concurrently (see
+    market.get_prices) since that's the slow part; on_match(match) fires as
+    each item's price resolves, so a caller can update a live on-screen overlay
+    incrementally.
     """
-    lines = ocr.extract_lines(image, sparse=True)
-    skip_indices: set[int] = set()
+    return _price_and_emit(_identify_region_items(image, items_index), on_match)
 
-    # First pass: OCR match every item and remember its (item, bbox), WITHOUT
-    # pricing yet, so all the network lookups can be batched concurrently.
-    identified: list[tuple[object, tuple[int, int, int, int]]] = []
-    for i, line in enumerate(lines):
-        if i in skip_indices:
-            continue
 
-        lx, ly, lw, lh = line.bbox
-        partner_idx = None
-        best_gap = None
-        for j, other in enumerate(lines):
-            if j == i or j in skip_indices:
-                continue
-            ox, oy, _ow, _oh = other.bbox
-            gap = oy - (ly + lh)
-            if gap < 0 or gap > lh:
-                continue  # not directly below (or too far below) this line
-            if abs(ox - lx) >= lw:
-                continue  # not aligned with this tile's left edge
-            if best_gap is None or gap < best_gap:
-                best_gap = gap
-                partner_idx = j
+def price_relic(image: Image.Image, items_index: ItemsIndex) -> list[RegionMatch]:
+    """Identify + price the up-to-4 reward names in a captured Void Fissure
+    reward-screen band (see relic_reward_rect for the capture geometry).
 
-        candidate_texts = [line.text]
-        if partner_idx is not None:
-            candidate_texts.insert(0, f"{line.text} {lines[partner_idx].text}")
+    Reuses the same cluster-then-match path as Multi-Select - the rewards sit
+    in separate columns whose x-spans don't overlap, so clustering keeps each
+    one distinct (the "one zone per item" separation WFInfo gets from column
+    density projection). Returns the full list at once (no on_match streaming):
+    relic mode picks the most valuable reward only after every price resolves.
+    """
+    return _price_and_emit(_identify_region_items(image, items_index), None)
 
-        matched_item = None
-        used_combo = False
-        for text in candidate_texts:
-            matched_item = items_index.match(text)
-            if matched_item is not None:
-                used_combo = text != line.text
-                break
 
-        if matched_item is None:
-            continue
+def relic_reward_rect(
+    screen_w: int, screen_h: int, ui_scale: float = 1.0
+) -> tuple[int, int, int, int]:
+    """Screen rectangle (left, top, right, bottom) of the reward-name band on
+    the Void Fissure reward-selection screen, from WFInfo's reference geometry.
 
-        bbox = line.bbox
-        if used_combo:
-            partner = lines[partner_idx]
-            skip_indices.add(partner_idx)
-            x0 = min(line.bbox[0], partner.bbox[0])
-            y0 = min(line.bbox[1], partner.bbox[1])
-            x1 = max(line.bbox[0] + line.bbox[2], partner.bbox[0] + partner.bbox[2])
-            y1 = max(line.bbox[1] + line.bbox[3], partner.bbox[1] + partner.bbox[3])
-            bbox = (x0, y0, x1 - x0, y1 - y0)
-
-        identified.append((matched_item, bbox))
-
-    return _price_and_emit(identified, on_match)
+    WFInfo measured the band at 1920x1080 with the in-game UI at 100%
+    (config.RELIC_PIXEL_REWARD_* constants) and scales it to the running
+    resolution: a >=16:9 window scales by height/1080, a narrower one by
+    width/1920 (WFInfo's Window.ScreenScaling), times the UI-size setting.
+    The band is centred horizontally and sits pixelRewardYDisplay above the
+    vertical centre.
+    """
+    if screen_w * 9 >= screen_h * 16:
+        screen_scaling = screen_h / 1080.0
+    else:
+        screen_scaling = screen_w / 1920.0
+    s = max(1e-6, screen_scaling * ui_scale)
+    width = int(config.RELIC_PIXEL_REWARD_WIDTH * s)
+    height = int(config.RELIC_PIXEL_REWARD_HEIGHT * s)
+    left = screen_w // 2 - width // 2
+    top = int(screen_h / 2 - config.RELIC_PIXEL_REWARD_Y_DISPLAY * s)
+    return (left, top, left + width, top + height)
 
 
 def _price_and_emit(
@@ -327,8 +279,7 @@ def _read_frames_texts(per_frame_bands: list[list[Image.Image]], profile: int = 
     Runs the frames concurrently for Tesseract (each ocr call spawns its own
     tesseract.exe subprocess, which releases the GIL - safe and a real
     speedup). EasyOCR shares one PyTorch model that is NOT safe to call from
-    multiple threads at once, and the vision engines cost money per call, so
-    those stay sequential.
+    multiple threads at once, so it stays sequential.
     """
     if len(per_frame_bands) <= 1 or config.OCR_ENGINE != "tesseract":
         return [ocr.read_name_bands(bands, profile) for bands in per_frame_bands]

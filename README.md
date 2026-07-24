@@ -110,10 +110,16 @@ the price in a small popup right next to your cursor.
 
 ### Multi-Select
 
-Drag a box around a whole shelf of items at once. On release, the entire region
-is captured, OCR'd for every item inside, and each one gets a **name + price
-label drawn directly over it on screen**, filled in one at a time as each is
-found and priced. Labels stay up until your next drag.
+Price a whole shelf of items at once. Press **Select Area** (or the scan
+hotkey) to arm a **one-shot** selection, drag a box around however many items
+you want, and release. The entire region is captured, OCR'd for every item
+inside, and each one gets a **name + price label drawn directly over it on
+screen**, filled in one at a time as each is found and priced. Labels stay up
+until your next selection.
+
+It's deliberately one-shot: the app only takes over the mouse once you ask it
+to, and hands it straight back on release — so your clicks stay yours the rest
+of the time.
 
 > **SCRN3** — _Multi-Select: price labels drawn over a batch of items_
 
@@ -329,6 +335,11 @@ The tray icon appears once the app is ready. Logs always go to
   over the game, so they're withdrawn for a split second before each grab and
   restored right after (otherwise a scan would read its own labels as items).
   The brief flicker is intentional; global hotkeys keep working while hidden.
+- **Any time you drag out a box** — setting the item box size, calibrating the
+  grid, or picking a Multi-Select region — the screen **dims and the app
+  captures your mouse** for that one drag. Nothing you click reaches the game,
+  so you can't accidentally select, equip, or highlight anything while
+  measuring. Press **Esc** (or right-click) to back out.
 
 ---
 

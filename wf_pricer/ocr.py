@@ -1,12 +1,10 @@
 """Turns a small scanned crop into a list of text lines, using whichever
-engine is configured (config.OCR_ENGINE): local EasyOCR, local Tesseract, or
-a cloud AI vision model (Claude or Gemini). All four converge on the same
-OcrLine shape so pipeline.py doesn't need to care which one produced it.
+engine is configured (config.OCR_ENGINE): local EasyOCR or local Tesseract.
+Both converge on the same OcrLine shape so pipeline.py doesn't need to care
+which one produced it.
 """
 from __future__ import annotations
 
-import base64
-import io
 import logging
 import threading
 from dataclasses import dataclass
@@ -14,9 +12,28 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image, ImageOps, ImageStat
 
-from . import config
+from . import config, segment
 
 log = logging.getLogger(__name__)
+
+
+def _adaptive_upscale_factor(height_px: int, base_factor: float) -> float:
+    """How much to enlarge a crop before OCR: at least `base_factor`, but
+    enough to bring an estimated glyph height of `height_px` up to
+    config.TESSERACT_TARGET_LINE_PX, capped at TESSERACT_MAX_UPSCALE_FACTOR so a
+    tiny crop can't be blown up into an enormous image. Small labels get the
+    boost they need; already-large ones aren't needlessly upscaled."""
+    factor = base_factor
+    if height_px > 0:
+        factor = max(factor, config.TESSERACT_TARGET_LINE_PX / height_px)
+    return max(1.0, min(config.TESSERACT_MAX_UPSCALE_FACTOR, factor))
+
+
+def _resize(image: Image.Image, factor: float) -> Image.Image:
+    if factor == 1.0:
+        return image
+    w, h = image.size
+    return image.resize((max(1, int(w * factor)), max(1, int(h * factor))), Image.LANCZOS)
 
 
 @dataclass(frozen=True)
@@ -28,10 +45,9 @@ class OcrLine:
 
 def extract_lines(image: Image.Image, sparse: bool = False) -> list[OcrLine]:
     """sparse=True is for a region that may contain several different
-    items' tiles (multi-select scans) rather than one tightly-cropped item
-    (single-item scans) - see TESSERACT_SPARSE_CONFIG for why this
-    matters. EasyOCR and the vision engines ignore it; they don't need the
-    distinction.
+    items' tiles (multi-select / relic scans) - see TESSERACT_SPARSE_CONFIG
+    for why this matters. EasyOCR ignores it; its detector already treats
+    spatially separate text as separate regions on its own.
     """
     engine = _ENGINES.get(config.OCR_ENGINE, _extract_lines_easyocr)
     return engine(image, sparse)
@@ -92,16 +108,18 @@ def _configure_tesseract() -> None:
     _tesseract_configured = True
 
 
-def _preprocess_for_tesseract(image: Image.Image) -> Image.Image:
-    """Grayscale + upscale + autocontrast, inverting if the crop is
-    predominantly dark (light-on-dark UI text reads much better to
-    Tesseract as dark-on-light).
+def _preprocess_for_tesseract(image: Image.Image, factor: float) -> Image.Image:
+    """Prepare a crop for Tesseract, enlarged by `factor`.
+
+    Two paths: with the colour filter on (config.TEXT_COLOR_FILTER_ENABLED),
+    isolate the theme's text colour to crisp dark-on-white and just resize it;
+    otherwise grayscale + autocontrast, inverting if the crop is predominantly
+    dark (light-on-dark UI text reads much better to Tesseract as dark-on-light).
     """
-    gray = image.convert("L")
-    factor = config.TESSERACT_UPSCALE_FACTOR
-    if factor != 1.0:
-        w, h = gray.size
-        gray = gray.resize((int(w * factor), int(h * factor)), Image.LANCZOS)
+    if config.TEXT_COLOR_FILTER_ENABLED:
+        binary = segment.isolate_text_color(image, config.TEXT_COLOR_RGB, config.TEXT_COLOR_TOLERANCE)
+        return _resize(binary, factor)
+    gray = _resize(image.convert("L"), factor)
     gray = ImageOps.autocontrast(gray, cutoff=1)
     if ImageStat.Stat(gray).mean[0] < 128:
         gray = ImageOps.invert(gray)
@@ -113,11 +131,14 @@ def _extract_lines_tesseract(image: Image.Image, sparse: bool = False) -> list[O
     from pytesseract import Output
 
     _configure_tesseract()
-    pre = _preprocess_for_tesseract(image)
+    # Adaptive: bring short crops up to the target glyph height, so the scale
+    # used to map OCR boxes back to source coords must match what preprocessing
+    # actually applied (below).
+    scale = _adaptive_upscale_factor(image.size[1], config.TESSERACT_UPSCALE_FACTOR)
+    pre = _preprocess_for_tesseract(image, scale)
     tess_config = config.TESSERACT_SPARSE_CONFIG if sparse else config.TESSERACT_CONFIG
     data = pytesseract.image_to_data(pre, config=tess_config, output_type=Output.DICT)
 
-    scale = config.TESSERACT_UPSCALE_FACTOR
     grouped: dict[tuple[int, int, int], list[tuple[str, int, int, int, int, float]]] = {}
     n = len(data["text"])
     for i in range(n):
@@ -149,98 +170,9 @@ def _extract_lines_tesseract(image: Image.Image, sparse: bool = False) -> list[O
     return lines
 
 
-_VISION_PROMPT = (
-    "This is a small cropped screenshot from the game Warframe's inventory UI, "
-    "showing one item's icon and/or name label. Respond with ONLY the exact "
-    "item name text as it appears (for example: Wisp Prime Systems Blueprint), "
-    "nothing else - no punctuation, no explanation. If you cannot identify any "
-    "item name text in the image, respond with exactly: NONE"
-)
-
-
-def _parse_vision_text(text: str, image: Image.Image) -> list[OcrLine]:
-    text = text.strip()
-    if not text or text.upper() == "NONE":
-        return []
-    w, h = image.size
-    return [OcrLine(text=text, bbox=(0, 0, w, h), conf=1.0)]
-
-
-# --- AI vision: Claude (Anthropic) -----------------------------------------
-_anthropic_client = None
-
-
-def _get_anthropic_client():
-    global _anthropic_client
-    if _anthropic_client is None:
-        import anthropic  # deferred: only needed for this engine
-
-        api_key = config.get_anthropic_api_key()
-        _anthropic_client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
-    return _anthropic_client
-
-
-def _extract_lines_claude_vision(image: Image.Image, sparse: bool = False) -> list[OcrLine]:
-    client = _get_anthropic_client()
-    buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="PNG")
-    b64 = base64.standard_b64encode(buf.getvalue()).decode("ascii")
-
-    try:
-        response = client.messages.create(
-            model=config.CLAUDE_VISION_MODEL,
-            max_tokens=64,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-                        {"type": "text", "text": _VISION_PROMPT},
-                    ],
-                }
-            ],
-        )
-    except Exception as exc:
-        # A rate limit or dropped connection on one band shouldn't abort the
-        # whole scan - report no text and let the other bands through.
-        log.warning("Claude Vision failed (%s), treating as no text", exc)
-        return []
-    text = "".join(block.text for block in response.content if block.type == "text")
-    return _parse_vision_text(text, image)
-
-
-# --- AI vision: Gemini (Google AI Studio) -----------------------------------
-_gemini_client = None
-
-
-def _get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None:
-        from google import genai  # deferred: only needed for this engine
-
-        api_key = config.get_google_api_key()
-        _gemini_client = genai.Client(api_key=api_key) if api_key else genai.Client()
-    return _gemini_client
-
-
-def _extract_lines_gemini_vision(image: Image.Image, sparse: bool = False) -> list[OcrLine]:
-    client = _get_gemini_client()
-    try:
-        response = client.models.generate_content(
-            model=config.GEMINI_VISION_MODEL,
-            contents=[image.convert("RGB"), _VISION_PROMPT],
-        )
-    except Exception as exc:
-        log.warning("Gemini Vision failed (%s), treating as no text", exc)
-        return []
-    return _parse_vision_text(response.text or "", image)
-
-
 _ENGINES = {
     "easyocr": _extract_lines_easyocr,
     "tesseract": _extract_lines_tesseract,
-    "claude_vision": _extract_lines_claude_vision,
-    "gemini_vision": _extract_lines_gemini_vision,
 }
 
 
@@ -282,11 +214,22 @@ def _preprocess_name_band(image: Image.Image, profile: int = 0) -> Image.Image:
     """
     prof = NAME_BAND_PROFILES[profile % len(NAME_BAND_PROFILES)]
 
-    gray = image.convert("L")
-    factor = prof["upscale"] if prof["upscale"] is not None else config.TESSERACT_UPSCALE_FACTOR
-    if factor != 1.0:
-        w, h = gray.size
-        gray = gray.resize((max(1, int(w * factor)), max(1, int(h * factor))), Image.LANCZOS)
+    # A profile can pin the upscale (e.g. no-upscale / big-upscale retries);
+    # otherwise adapt it to the band height so small labels reach a legible size.
+    if prof["upscale"] is not None:
+        factor = prof["upscale"]
+    else:
+        factor = _adaptive_upscale_factor(image.size[1], config.TESSERACT_UPSCALE_FACTOR)
+
+    # With the colour filter on, isolate the theme text colour for the
+    # BINARIZING profiles; the no-binarize retry profiles keep the brightness
+    # path on purpose, so a band the colour filter over-eats can still be
+    # rescued on a later pass.
+    if config.TEXT_COLOR_FILTER_ENABLED and prof["binarize"]:
+        binary = segment.isolate_text_color(image, config.TEXT_COLOR_RGB, config.TEXT_COLOR_TOLERANCE)
+        return _resize(binary, factor)
+
+    gray = _resize(image.convert("L"), factor)
     gray = ImageOps.autocontrast(gray, cutoff=2)
 
     if not prof["binarize"]:
@@ -347,27 +290,15 @@ def read_name_bands(bands: list[Image.Image], profile: int = 0) -> list[str]:
     For Tesseract this stacks the bands into ONE tall montage and OCRs it in a
     single call (pytesseract spawns tesseract.exe per call, so per-band OCR of
     a whole grid would be dozens of spawns), then maps each detected word back
-    to its band by vertical position. EasyOCR reads the montage in one call
-    too. The cloud vision engines have no batch path, so they fall back to one
-    call per band - slow and money per band, flagged as a known gap for grid
-    mode, same as multi-select.
+    to its band by vertical position. EasyOCR reads the montage in one call too.
     """
     if not bands:
         return []
     processed = [_preprocess_name_band(b, profile) for b in bands]
 
-    engine = config.OCR_ENGINE
-    if engine == "tesseract":
+    if config.OCR_ENGINE == "tesseract":
         return _read_name_bands_tesseract(processed)
-    if engine == "easyocr":
-        return _read_name_bands_easyocr(processed)
-    # claude_vision / gemini_vision: no batch API - one call per band.
-    reader = _ENGINES.get(engine, _extract_lines_easyocr)
-    results: list[str] = []
-    for band in processed:
-        lines = reader(band.convert("RGB"))
-        results.append(" ".join(l.text for l in lines).strip())
-    return results
+    return _read_name_bands_easyocr(processed)
 
 
 def _montage(bands: list[Image.Image]) -> tuple[Image.Image, list[tuple[int, int]]]:

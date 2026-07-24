@@ -1,7 +1,8 @@
-"""Single-item scanning: grab a fixed-size box centered on the cursor and
-hand it off for OCR + pricing. Replaces the old multi-screenshot capture
-flow - one hotkey press always means exactly one item, so there's no room
-for a batch of screenshots to produce more matches than there are items.
+"""Screen-capture helpers shared by every scan mode: grab an arbitrary
+region (multi-select / relic), a stack of rapid frames (grid voting), or the
+whole virtual desktop (the on-screen colour eyedropper), plus the global
+hotkey listener. All coordinates are physical pixels on the virtual desktop
+(the process is per-monitor DPI aware; see main._set_dpi_aware).
 """
 from __future__ import annotations
 
@@ -84,18 +85,16 @@ def force_foreground(window) -> None:
         log.debug("force_foreground failed", exc_info=True)
 
 
-def grab_box_at(cx: int, cy: int, box_w: int, box_h: int) -> Image.Image:
-    """Grabs a box_w x box_h region of the screen centered on (cx, cy),
-    clamped so it never reaches past the virtual desktop's edges.
+def grab_virtual_screen() -> tuple[Image.Image, tuple[int, int]]:
+    """Grab the ENTIRE virtual desktop (all monitors) as one image, returning
+    (image, (left, top)) where (left, top) is the desktop's top-left in screen
+    coords. Pixel (px, py) in the image is at screen (left + px, top + py) - the
+    mapping the colour eyedropper uses to turn a click into a sampled pixel.
+    all_screens=True is required or secondary/left/above monitors are missed.
     """
     vleft, vtop, vwidth, vheight = virtual_screen_rect()
-    vright, vbottom = vleft + vwidth, vtop + vheight
-
-    left = cx - box_w // 2
-    top = cy - box_h // 2
-    left = max(vleft, min(left, vright - box_w))
-    top = max(vtop, min(top, vbottom - box_h))
-    return ImageGrab.grab(bbox=(left, top, left + box_w, top + box_h))
+    img = ImageGrab.grab(bbox=(vleft, vtop, vleft + vwidth, vtop + vheight), all_screens=True)
+    return img, (vleft, vtop)
 
 
 def grab_region(left: int, top: int, right: int, bottom: int) -> Image.Image:
@@ -123,88 +122,6 @@ def capture_frames(left: int, top: int, right: int, bottom: int, n: int, delay: 
         if i < n - 1:
             time.sleep(delay)
     return frames
-
-
-class CursorTracker:
-    """Continuously reports the cursor's position via on_move while active -
-    used to keep the scan-mode box outline glued to the mouse. Not a
-    persistent global hook: it's only started while scan mode is toggled
-    on, and stopped as soon as it's toggled off.
-    """
-
-    def __init__(self, on_move: Callable[[int, int], None]) -> None:
-        self._on_move = on_move
-        self._listener: mouse.Listener | None = None
-
-    def start(self) -> None:
-        if self._listener is not None:
-            return
-        self._listener = mouse.Listener(on_move=lambda x, y: self._on_move(x, y))
-        self._listener.start()
-
-    def stop(self) -> None:
-        if self._listener is not None:
-            self._listener.stop()
-            self._listener = None
-
-
-class DragSelectWatcher:
-    """Watches for left-click-drags anywhere on screen and reports each
-    completed drag's bounding box - used for multi-select scan mode. Unlike
-    the one-shot BoxSizeCalibrator, this keeps listening for repeated drags
-    until explicitly stopped (i.e. for as long as multi-select scan mode
-    stays toggled on), so you can select and scan several regions in a row
-    without re-arming anything.
-    """
-
-    MIN_DRAG_PX = 10
-
-    def __init__(
-        self,
-        on_drag_start: Callable[[int, int], None],
-        on_drag_update: Callable[[int, int], None],
-        on_drag_end: Callable[[int, int, int, int], None],
-    ) -> None:
-        self._on_drag_start = on_drag_start
-        self._on_drag_update = on_drag_update
-        self._on_drag_end = on_drag_end
-        self._start: tuple[int, int] | None = None
-        self._listener: mouse.Listener | None = None
-
-    def start(self) -> None:
-        if self._listener is not None:
-            return
-        self._listener = mouse.Listener(on_click=self._on_click, on_move=self._on_move)
-        self._listener.start()
-
-    def stop(self) -> None:
-        if self._listener is not None:
-            self._listener.stop()
-            self._listener = None
-        self._start = None
-
-    def _on_click(self, x: int, y: int, button: mouse.Button, pressed: bool) -> None:
-        if button != mouse.Button.left:
-            return
-        if pressed:
-            self._start = (x, y)
-            self._on_drag_start(x, y)
-            return
-
-        start = self._start
-        self._start = None
-        if start is None:
-            return
-        x0, y0 = start
-        if abs(x - x0) < self.MIN_DRAG_PX or abs(y - y0) < self.MIN_DRAG_PX:
-            return  # too small - treat as a stray click, not a real selection
-        left, right = sorted((x0, x))
-        top, bottom = sorted((y0, y))
-        self._on_drag_end(left, top, right, bottom)
-
-    def _on_move(self, x: int, y: int) -> None:
-        if self._start is not None:
-            self._on_drag_update(x, y)
 
 
 class HotkeyListener:

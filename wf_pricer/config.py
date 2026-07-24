@@ -7,7 +7,6 @@ creating the data folders, so it's safe to import from anywhere.
 from __future__ import annotations
 
 import json
-import os
 import shutil
 from pathlib import Path
 
@@ -22,13 +21,12 @@ for _d in (CACHE_DIR, LOGS_DIR):
 
 ITEMS_CACHE_FILE = CACHE_DIR / "items.json"
 PRICE_CACHE_FILE = CACHE_DIR / "prices.json"
-BOX_CALIBRATION_FILE = CACHE_DIR / "box_calibration.json"
 GRID_CALIBRATION_FILE = CACHE_DIR / "grid_calibration.json"
 OCR_ENGINE_FILE = CACHE_DIR / "ocr_engine.json"
 HOTKEYS_FILE = CACHE_DIR / "hotkeys.json"
 MATCH_TOLERANCE_FILE = CACHE_DIR / "match_tolerance.json"
-ANTHROPIC_API_KEY_FILE = CACHE_DIR / "anthropic_api_key.json"
-GOOGLE_API_KEY_FILE = CACHE_DIR / "google_api_key.json"
+COLOR_FILTER_FILE = CACHE_DIR / "color_filter.json"
+RELIC_FILE = CACHE_DIR / "relic.json"
 LOG_FILE = LOGS_DIR / "app.log"
 SCAN_LOG_FILE = LOGS_DIR / "scans.txt"
 
@@ -69,47 +67,6 @@ def save_hotkeys(scan: str, toggle: str, quit_: str, search: str) -> None:
 
 load_hotkeys()
 
-# --- Item box size (set once via the "Set Item Box Size..." button) --------
-# The pixel size of the box grabbed around the cursor on each scan, centered
-# on wherever the mouse is when HOTKEY_SCAN is pressed. None until the user
-# calibrates it (drag a box around one item's icon+name once).
-BOX_WIDTH_PX: int | None = None
-BOX_HEIGHT_PX: int | None = None
-
-
-def load_box_calibration() -> None:
-    """Loads data/cache/box_calibration.json (if present) into the
-    BOX_*_PX globals above.
-    """
-    global BOX_WIDTH_PX, BOX_HEIGHT_PX
-    if not BOX_CALIBRATION_FILE.exists():
-        return
-    try:
-        data = json.loads(BOX_CALIBRATION_FILE.read_text(encoding="utf-8"))
-        BOX_WIDTH_PX = int(data["width_px"])
-        BOX_HEIGHT_PX = int(data["height_px"])
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        pass
-
-
-def save_box_calibration(width_px: int, height_px: int) -> None:
-    global BOX_WIDTH_PX, BOX_HEIGHT_PX
-    BOX_WIDTH_PX = width_px
-    BOX_HEIGHT_PX = height_px
-    BOX_CALIBRATION_FILE.write_text(
-        json.dumps({"width_px": width_px, "height_px": height_px}), encoding="utf-8"
-    )
-
-
-def clear_box_calibration() -> None:
-    global BOX_WIDTH_PX, BOX_HEIGHT_PX
-    BOX_WIDTH_PX = None
-    BOX_HEIGHT_PX = None
-    BOX_CALIBRATION_FILE.unlink(missing_ok=True)
-
-
-load_box_calibration()
-
 # --- Inventory grid calibration (for Grid Scan mode) -----------------------
 # Describes a fixed R x C grid of item slots by the position/size of each
 # slot's NAME BAND (the small text label), derived from boxing the first
@@ -148,6 +105,76 @@ def clear_grid_calibration() -> None:
 
 load_grid_calibration()
 
+# --- Relic reward scanner (WFInfo-style) --------------------------------
+# On the Void Fissure reward-selection screen the up-to-4 reward names sit in
+# a band across the top-centre. WFInfo locates that band with these reference
+# constants (measured at 1920x1080, in-game UI scale 100%) and scales them to
+# the actual resolution; we do the same in pipeline.relic_reward_rect. If your
+# HUD is offset (unusual UI scale, ultrawide letterboxing, custom overlays),
+# calibrate an explicit rectangle instead - RELIC_REGION overrides the auto rect.
+RELIC_PIXEL_REWARD_WIDTH = 968
+RELIC_PIXEL_REWARD_HEIGHT = 235
+RELIC_PIXEL_REWARD_Y_DISPLAY = 316
+
+# The in-game Interface "size" setting (Options > Interface). 1.0 = 100%.
+# Only matters for the auto rectangle; a calibrated RELIC_REGION ignores it.
+RELIC_UI_SCALE = 1.0
+RELIC_UI_SCALE_MIN = 0.5
+RELIC_UI_SCALE_MAX = 2.0
+
+# Optional explicit capture rectangle (screen coords) overriding the auto one.
+# {"left","top","right","bottom"} or None.
+RELIC_REGION: dict | None = None
+
+
+def load_relic_settings() -> None:
+    global RELIC_UI_SCALE, RELIC_REGION
+    if not RELIC_FILE.exists():
+        return
+    try:
+        data = json.loads(RELIC_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    try:
+        RELIC_UI_SCALE = _clamp_ui_scale(float(data["ui_scale"]))
+    except (KeyError, TypeError, ValueError):
+        pass
+    region = data.get("region")
+    if isinstance(region, dict) and all(k in region for k in ("left", "top", "right", "bottom")):
+        RELIC_REGION = {k: int(region[k]) for k in ("left", "top", "right", "bottom")}
+
+
+def save_relic_ui_scale(scale: float) -> None:
+    global RELIC_UI_SCALE
+    RELIC_UI_SCALE = _clamp_ui_scale(scale)
+    _write_relic_settings()
+
+
+def save_relic_region(left: int, top: int, right: int, bottom: int) -> None:
+    global RELIC_REGION
+    RELIC_REGION = {"left": int(left), "top": int(top), "right": int(right), "bottom": int(bottom)}
+    _write_relic_settings()
+
+
+def clear_relic_region() -> None:
+    global RELIC_REGION
+    RELIC_REGION = None
+    _write_relic_settings()
+
+
+def _write_relic_settings() -> None:
+    payload: dict = {"ui_scale": RELIC_UI_SCALE}
+    if RELIC_REGION is not None:
+        payload["region"] = RELIC_REGION
+    RELIC_FILE.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _clamp_ui_scale(v: float) -> float:
+    return max(RELIC_UI_SCALE_MIN, min(RELIC_UI_SCALE_MAX, v))
+
+
+load_relic_settings()
+
 # How many rapid frames to capture and vote across per grid scan, and the
 # delay between them. Voting across frames beats OCR errors caused by
 # Warframe's animated item-card backgrounds (the same slot renders slightly
@@ -165,16 +192,19 @@ GRID_SCAN_FRAME_DELAY_S = 0.12
 GRID_SCAN_MAX_RETRY_PROFILES = 3  # extra profiles beyond the default first pass
 
 # --- Selection mode ------------------------------------------------------
-# "single" - hover an item, press the scan hotkey; grabs a fixed-size box
-#            (BOX_WIDTH_PX x BOX_HEIGHT_PX) centered on the cursor.
 # "multi"  - drag a box around any number of items; on release, that whole
 #            region is captured and scanned for every item inside it,
 #            labeling each one in place with its name and price.
-# "grid"   - WFInfo-style. Calibrate a fixed R x C slot grid once, then the
-#            scan hotkey OCRs every slot's name band (with multi-frame
-#            voting) and labels each slot with its price.
-SELECTION_MODE = "single"  # "single" | "multi" | "grid"
-_VALID_SELECTION_MODES = ("single", "multi", "grid")
+# "grid"   - calibrate a fixed R x C slot grid once, then the scan hotkey
+#            OCRs every slot's name band (with multi-frame voting) and labels
+#            each slot with its price.
+# "relic"  - on the Void Fissure reward-selection screen, press the scan
+#            hotkey: the up-to-4 reward names across the top-centre are read,
+#            priced, and the most valuable is starred. The capture rectangle is
+#            derived from the reward-screen geometry scaled to your resolution
+#            (see relic_reward_rect / RELIC_UI_SCALE).
+SELECTION_MODE = "multi"  # "multi" | "grid" | "relic"
+_VALID_SELECTION_MODES = ("multi", "grid", "relic")
 SELECTION_MODE_FILE = CACHE_DIR / "selection_mode.json"
 
 
@@ -250,35 +280,18 @@ def _clamp_workers(n: int) -> int:
 load_price_fetch_workers()
 
 # --- OCR engine choice ------------------------------------------------------
-# "easyocr"       - local deep-learning OCR. Most accurate on messy/stylized
-#                   game text, but the slowest (a real neural network) and
-#                   has a one-time model download.
-# "tesseract"     - local classical OCR. Much faster (near-instant on a
-#                   small, tightly-cropped single-item box), fully offline,
-#                   but was prone to misreading decorative icon art as text
-#                   on full screenshots - less of a concern now that scans
-#                   are just one small crop at a time.
-# "claude_vision" - sends the crop to Anthropic's Claude API to read
-#                   directly. Needs your own Anthropic API key, an internet
-#                   connection per scan, and costs a small amount of money
-#                   per scan. Currently disabled in the UI (in development -
-#                   see DISABLED_ENGINES below).
-# "gemini_vision" - sends the crop to Google's Gemini API (AI Studio) to
-#                   read directly. Same trade-offs as claude_vision, needs
-#                   your own Google AI Studio API key instead. Also
-#                   currently disabled in the UI.
+# "easyocr"   - local deep-learning OCR. Most accurate on messy/stylized game
+#               text, but the slowest (a real neural network) and has a
+#               one-time model download.
+# "tesseract" - local classical OCR. Much faster (near-instant on a small,
+#               tightly-cropped band), fully offline.
 # Changeable at runtime via the window's "OCR Engine" dropdown; persisted to
 # data/cache/ocr_engine.json so your choice survives a restart. Default is
 # Tesseract - fast with no warm-up, which matters more day-to-day than
 # EasyOCR's extra accuracy for most scans; switch to EasyOCR from the
 # dropdown if you're getting more misreads than you'd like.
-OCR_ENGINE = "tesseract"  # "easyocr" | "tesseract" | "claude_vision" | "gemini_vision"
-_VALID_ENGINES = ("easyocr", "tesseract", "claude_vision", "gemini_vision")
-# Not selectable from the UI yet (still being tested) - the dropdown shows
-# them labeled "(in development)" and refuses to switch to them, and their
-# "Set ... Key" buttons are disabled. The engines themselves still work if
-# you set OCR_ENGINE here directly, or via ocr_engine.json.
-DISABLED_ENGINES = ("claude_vision", "gemini_vision")
+OCR_ENGINE = "tesseract"  # "easyocr" | "tesseract"
+_VALID_ENGINES = ("easyocr", "tesseract")
 
 
 def load_ocr_engine() -> None:
@@ -330,6 +343,14 @@ def _find_tesseract() -> str | None:
 
 TESSERACT_PATH = _find_tesseract()
 TESSERACT_UPSCALE_FACTOR = 2.0
+# Tesseract reads most reliably when glyphs are roughly this tall. Rather than
+# a single fixed multiplier (which leaves small labels too small and needlessly
+# blows up already-large ones), the preprocessing upscales just enough to bring
+# the estimated text height up to this target - never below TESSERACT_UPSCALE_
+# FACTOR, and capped so a tiny crop can't be scaled into a huge image. A WFInfo
+# trick: it upsizes every reward/word zone to a minimum height before OCR.
+TESSERACT_TARGET_LINE_PX = 40
+TESSERACT_MAX_UPSCALE_FACTOR = 4.0
 TESSERACT_MIN_CONFIDENCE = 40  # 0-100 scale (different from EasyOCR's 0.0-1.0)
 # psm 6 = "a single uniform block of text" - a good fit for Single Item
 # mode's one small, tightly-cropped box.
@@ -365,54 +386,67 @@ TESSERACT_GRID_CONFIG = "--oem 3 --psm 6"
 # it if backgrounds still bleed through, lower it if thin strokes vanish.
 GRID_BINARIZE_CUTOFF = 140  # 0-255
 
-# --- AI vision (Claude / Gemini) --------------------------------------------
-# Both providers' API keys resolve the same way: a gitignored data/cache/
-# file (set via the save_*_api_key() functions, never hand-edit these files
-# into being tracked), falling back to the provider's standard environment
-# variable. Deliberately NOT constants in this file - config.py is tracked
-# by git, so a literal key written here would end up committed.
-CLAUDE_VISION_MODEL = "claude-haiku-4-5-20251001"
-GEMINI_VISION_MODEL = "gemini-2.5-flash"
+# --- Text colour filter (WFInfo-style, optional) ------------------------
+# When enabled, preprocessing keeps only pixels close to a chosen UI text
+# colour and blacks out everything else (see segment.isolate_text_color),
+# instead of the default brightness threshold. This is the big lever against
+# Warframe's animated card art and off-theme UI chrome bleeding into the OCR -
+# but it only works if the colour is set to YOUR interface theme's text colour,
+# so it ships OFF and is toggled + configured from the Settings tab.
+#
+# TEXT_COLOR_RGB is that text colour; the default is the near-white of the
+# stock theme. TEXT_COLOR_TOLERANCE is how far a pixel may sit from it and
+# still count as text, on the weighted-distance scale used by
+# isolate_text_color (0-765; ~120-180 is a sensible band). Raise it if real
+# text is being dropped, lower it if background art is leaking through.
+TEXT_COLOR_FILTER_ENABLED = False
+TEXT_COLOR_RGB = (232, 230, 214)
+TEXT_COLOR_TOLERANCE = 140
+TEXT_COLOR_TOLERANCE_MIN = 40
+TEXT_COLOR_TOLERANCE_MAX = 400
 
 
-def get_anthropic_api_key() -> str | None:
-    if ANTHROPIC_API_KEY_FILE.exists():
+def load_color_filter() -> None:
+    global TEXT_COLOR_FILTER_ENABLED, TEXT_COLOR_RGB, TEXT_COLOR_TOLERANCE
+    if not COLOR_FILTER_FILE.exists():
+        return
+    try:
+        data = json.loads(COLOR_FILTER_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    TEXT_COLOR_FILTER_ENABLED = bool(data.get("enabled", TEXT_COLOR_FILTER_ENABLED))
+    rgb = data.get("rgb")
+    if isinstance(rgb, (list, tuple)) and len(rgb) == 3:
         try:
-            data = json.loads(ANTHROPIC_API_KEY_FILE.read_text(encoding="utf-8"))
-            key = data.get("anthropic_api_key")
-            if key:
-                return key
-        except (OSError, json.JSONDecodeError):
+            TEXT_COLOR_RGB = tuple(max(0, min(255, int(c))) for c in rgb)
+        except (TypeError, ValueError):
             pass
-    return os.environ.get("ANTHROPIC_API_KEY")
+    try:
+        TEXT_COLOR_TOLERANCE = _clamp_color_tolerance(int(data["tolerance"]))
+    except (KeyError, TypeError, ValueError):
+        pass
 
 
-def save_anthropic_api_key(key: str) -> None:
-    ANTHROPIC_API_KEY_FILE.write_text(json.dumps({"anthropic_api_key": key}), encoding="utf-8")
+def save_color_filter(enabled: bool, rgb: tuple[int, int, int], tolerance: int) -> None:
+    global TEXT_COLOR_FILTER_ENABLED, TEXT_COLOR_RGB, TEXT_COLOR_TOLERANCE
+    TEXT_COLOR_FILTER_ENABLED = bool(enabled)
+    TEXT_COLOR_RGB = tuple(max(0, min(255, int(c))) for c in rgb)
+    TEXT_COLOR_TOLERANCE = _clamp_color_tolerance(tolerance)
+    COLOR_FILTER_FILE.write_text(
+        json.dumps({
+            "enabled": TEXT_COLOR_FILTER_ENABLED,
+            "rgb": list(TEXT_COLOR_RGB),
+            "tolerance": TEXT_COLOR_TOLERANCE,
+        }),
+        encoding="utf-8",
+    )
 
 
-def clear_anthropic_api_key() -> None:
-    ANTHROPIC_API_KEY_FILE.unlink(missing_ok=True)
+def _clamp_color_tolerance(v: int) -> int:
+    return max(TEXT_COLOR_TOLERANCE_MIN, min(TEXT_COLOR_TOLERANCE_MAX, v))
 
 
-def get_google_api_key() -> str | None:
-    if GOOGLE_API_KEY_FILE.exists():
-        try:
-            data = json.loads(GOOGLE_API_KEY_FILE.read_text(encoding="utf-8"))
-            key = data.get("google_api_key")
-            if key:
-                return key
-        except (OSError, json.JSONDecodeError):
-            pass
-    return os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-
-
-def save_google_api_key(key: str) -> None:
-    GOOGLE_API_KEY_FILE.write_text(json.dumps({"google_api_key": key}), encoding="utf-8")
-
-
-def clear_google_api_key() -> None:
-    GOOGLE_API_KEY_FILE.unlink(missing_ok=True)
+load_color_filter()
 
 # --- Item matching -----------------------------------------------------
 # The minimum similarity (0-100) a candidate must reach to be reported at all.
