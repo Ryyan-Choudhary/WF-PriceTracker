@@ -178,7 +178,8 @@ picture from warframe.market:
 ## The Settings tab
 
 Everything configurable lives on the **Settings** tab, grouped into sections.
-Changes are saved to `data/cache/` and persist across restarts.
+Changes are saved under your per-user data folder
+(`%LOCALAPPDATA%\WF-PriceTracker\cache` on Windows) and persist across restarts.
 
 > **SCRN7** — _the Settings tab_
 
@@ -263,27 +264,19 @@ Choose per your priorities — speed, accuracy, offline vs. online, free vs. pai
   game text, but pays a one-time ~15s model-load on the first scan of each run,
   then a couple of seconds per scan. Fully offline after its one-time model
   download. Switch to it if Tesseract keeps misreading a particular screen.
-- **Claude Vision** *(in development)* — sends the crop to Anthropic's
-  `claude-haiku-4-5` to read directly. A multimodal AI model reads the image
-  far more robustly than classical OCR on stylised text, but needs **your own
-  Anthropic API key**, an internet connection per scan, and costs a small amount
-  of money per scan.
-- **Gemini Vision** *(in development)* — the same idea via Google's
-  `gemini-2.5-flash`, using **your own Google AI Studio API key**.
-
-> The two AI-vision engines are **currently disabled in the UI** (labelled "in
-> development" — selecting one snaps back to the active engine, and their key
-> buttons are greyed out). The code paths work if you set `config.OCR_ENGINE`
-> directly and supply a key, but there's no supported UI path yet. Multi-select
-> region scanning is a known gap for them specifically — their prompt expects
-> one item per image.
-
-**Never put a real API key as a literal in `wf_pricer/config.py`** (it's tracked
-by git). Keys belong in `data/cache/anthropic_api_key.json` /
-`data/cache/google_api_key.json` (both gitignored), or the `ANTHROPIC_API_KEY` /
-`GOOGLE_API_KEY` (or `GEMINI_API_KEY`) environment variables.
 
 ---
+
+## Download (Windows)
+
+Grab the latest **`WF-PriceTracker.exe`** from the
+[**Releases**](../../releases/latest) page and double-click it — no Python
+needed. The packaged exe uses the **Tesseract** engine, which is a separate
+one-time install: `winget install --id UB-Mannheim.TesseractOCR -e`.
+
+Want **EasyOCR** (more accurate on stylised text) or to hack on the code? Run
+from source instead — see Setup below. Building the exe yourself is documented in
+[RELEASING.md](RELEASING.md).
 
 ## Setup
 
@@ -292,8 +285,13 @@ don't reliably have prebuilt wheels for the newest Python versions yet).
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install -e .
 ```
+
+`pip install -e .` reads [`pyproject.toml`](pyproject.toml) and installs the app
+(and its dependencies) in editable mode, which also registers a `wf-pricer`
+command. If you'd rather not install, `pip install -r requirements.txt` still
+works — the launchers put `src/` on the path themselves.
 
 Tesseract (the default engine) needs a separate one-time install:
 `winget install --id UB-Mannheim.TesseractOCR -e`. EasyOCR is pure Python
@@ -303,15 +301,22 @@ first use (one-time, cached under `%USERPROFILE%\.EasyOCR`).
 ## Running it
 
 ```powershell
-# with a console window (recommended the first time, so you can see what's happening)
+# installed entry point (after `pip install -e .`)
+.venv\Scripts\wf-pricer.exe
+# or, equivalently:
+.venv\Scripts\python.exe -m wf_pricer
+
+# with a console window, no install needed (good for first-time debugging)
 .venv\Scripts\python.exe run.py
 
 # silent, no console window (double-click WF-PriceTracker.bat to do the same)
 .venv\Scripts\pythonw.exe run.pyw
 ```
 
-The tray icon appears once the app is ready. Logs always go to
-`data/logs/app.log`, so if something seems to silently fail, check there first.
+The tray icon appears once the app is ready. Runtime data (cache, logs) lives in
+your per-user data folder — on Windows `%LOCALAPPDATA%\WF-PriceTracker`. Logs go
+to `…\WF-PriceTracker\logs\app.log`, so if something seems to silently fail,
+check there first.
 
 ## Usage tips
 
@@ -327,7 +332,8 @@ The tray icon appears once the app is ready. Logs always go to
   might genuinely want to price the full bundle.
 - OCR works best where item names are legible text (Mods, Relics, Prime Parts
   screens). See the OCR section above for the limits.
-- The item catalog is cached for 3 days, prices for 10 minutes (`data/cache/`).
+- The item catalog is cached for 3 days, prices for 10 minutes (in your
+  per-user data folder — see Setup).
 - **Calibrate the Grid band tightly around JUST the name text**, not the whole
   tile, so it doesn't catch the game's `✓`/quantity badge on owned items.
   Recalibrate whenever the inventory layout or window size changes.
@@ -361,20 +367,32 @@ without hooking into anything it shouldn't.
 ## Project layout
 
 ```
-wf_pricer/
-  config.py     settings: hotkeys, folders, box size, grid calibration, selection mode,
-                OCR engine, match tolerance, price threads, API key storage
-  scan.py       screen grabs, global hotkeys, cursor tracking, drag-select watcher,
-                Windows foreground-focus helper (for the quick-search popup)
-  ocr.py        Tesseract / EasyOCR / Claude / Gemini engines + name-band preprocessing
+pyproject.toml    packaging, dependencies, `wf-pricer` entry point, tool config
+run.py / run.pyw  no-install launchers (console / silent); WF-PriceTracker.bat wraps run.pyw
+src/wf_pricer/
+  config.py     settings: hotkeys, folders (per-user data dir), grid calibration,
+                selection mode, OCR engine, match tolerance, price threads, tracking layout
+  scan.py       screen grabs, global hotkeys, drag-select watcher, click-through +
+                Windows foreground-focus helpers
+  ocr.py        Tesseract / EasyOCR engines + name-band preprocessing
   items_db.py   catalog fetch/cache + two-stage anchored fuzzy matching (excludes Sets,
                 refuses ambiguous ties) + full-catalog search index
   market.py     warframe.market order fetch/cache (thread-safe), concurrent pricing,
                 per-item stats (order book, per-rank tiers, 48h volume)
-  pipeline.py   price_crop (single) / price_region (multi) / price_grid (grid)
+  pipeline.py   price_region (multi) / price_relic (relic) / price_grid (grid)
+  worldstate.py live Warframe cycles for the Tracking HUD (warframestat.us)
+  glyphs.py     emoji icons rendered to images for the HUD
   gui.py        tabbed window, dark theme, overlays, quick-search + stats popups
   tray.py       tray icon image
-  main.py       app entry point (window + tray + hotkeys wiring)
-run.py / run.pyw  launchers (console / silent)
-data/           cache, logs (all gitignored)
+  main.py       app wiring (window + tray + hotkeys); `python -m wf_pricer` via __main__.py
+tests/          test_matching.py (matcher accuracy)
+assets/         screenshots + icon.ico
+scripts/build.py         builds the exe via PyInstaller
+WF-PriceTracker.spec     PyInstaller build spec (Tesseract-only, windowed, one-file)
+.github/workflows/       release.yml — builds the exe + publishes a Release on a v* tag
 ```
+
+Runtime data (cache, logs) is written to a per-user data dir outside the repo
+(`%LOCALAPPDATA%\WF-PriceTracker` on Windows), not committed. Build artifacts
+(`build/`, `dist/`) are gitignored — the exe ships via GitHub Releases (see
+[RELEASING.md](RELEASING.md)).

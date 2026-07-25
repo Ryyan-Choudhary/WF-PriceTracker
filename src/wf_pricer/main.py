@@ -1,17 +1,18 @@
 """WF-PriceTracker entry point.
 
 Run with `python -m wf_pricer.main` (or via run.py / run.pyw at the repo
-root). Opens an app window plus a tray icon. F10 toggles scan mode;
-Ctrl+F10 quits. What scanning actually does depends on the Selection Mode
-picked in the window:
+root). Opens an app window plus a tray icon. F9 runs a scan for the current
+mode; Ctrl+F10 quits; F7 clears any on-screen result labels. There's no scan
+mode to arm - the scan hotkey (and the window's action button) act on demand.
+What a scan does depends on the Selection Mode picked in the window:
 
-  - Multi-Select (default) - drag a box around any number of items;
-    releasing the drag captures that whole region, OCRs it for every item
-    inside, and labels each one in place with its name and price.
-  - Grid Scan - calibrate a fixed slot grid once, then the scan hotkey OCRs
-    every slot's name band and prices the lot.
-  - Relic Reward - on the Void Fissure reward screen, the scan hotkey reads
-    the reward names, prices them, and stars the most valuable.
+  - Multi-Select (default) - F9 arms a one-shot area pick; drag a box around
+    any number of items and release, and that whole region is captured,
+    OCR'd, and every item found is labelled in place with its price.
+  - Grid Scan - calibrate a fixed slot grid once, then F9 OCRs every slot's
+    name band and prices the lot.
+  - Relic Reward - on the Void Fissure reward screen, F9 reads the reward
+    names, prices them, and stars the most valuable.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ from logging.handlers import RotatingFileHandler
 
 import pystray
 
-from . import config, gui, items_db, market, pipeline, scan
+from . import config, gui, items_db, market, pipeline, scan, worldstate
 from . import tray as tray_mod
 
 log = logging.getLogger(__name__)
@@ -70,7 +71,6 @@ class App:
         self.icon: pystray.Icon | None = None
         self.window: gui.AppWindow | None = None
         self.items_index = None
-        self.scan_active = False
         self.scan_count = 0
         self.selection_mode = config.SELECTION_MODE
         self.hotkeys: scan.HotkeyListener | None = None
@@ -79,6 +79,10 @@ class App:
         # being bound don't also fire the action they're being bound to.
         self._capturing_hotkey = False
         self._catalog_refresh_lock = threading.Lock()
+        # World-state Display HUD.
+        self.display_enabled = list(config.DISPLAY_ENABLED)
+        self._display_active = False
+        self._display_stop = threading.Event()
 
     def load_items(self) -> None:
         try:
@@ -115,34 +119,11 @@ class App:
             self.window.set_search_catalog(self.items_index.search_entries())
 
     # --- hotkey / button callbacks --------------------------------------
-    def on_toggle_scan(self) -> None:
-        if self._capturing_hotkey:
-            return
-        self.scan_active = not self.scan_active
-        self._refresh_icon()
-        if self.scan_active:
-            self._start_mode_listener()
-        else:
-            self._stop_mode_listener()
-        if not self.window:
-            return
-        self.window.set_scan_active(self.scan_active)
-        if self.scan_active:
-            if self.selection_mode == "grid":
-                self.window.log("--- Scan mode ON: open your inventory, press the scan hotkey ---")
-            elif self.selection_mode == "relic":
-                self.window.log("--- Scan mode ON: open the reward screen, press the scan hotkey ---")
-            else:  # multi
-                self.window.log("--- Scan mode ON: drag a box around any items to scan them ---")
-        else:
-            self.window.log("--- Scan mode OFF ---")
-
     def on_scan(self) -> None:
+        # The scan hotkey (and the window's single action button) does whatever
+        # the current selection mode needs, on demand - there's no separate
+        # "scan mode" to arm first.
         if self._capturing_hotkey:
-            return
-        if not self.scan_active:
-            if self.window:
-                self.window.log("Not scanning - turn on Scan Mode first.")
             return
         if self.selection_mode == "grid":
             if config.GRID is None:
@@ -164,15 +145,10 @@ class App:
     def set_selection_mode(self, mode: str) -> None:
         if mode == self.selection_mode:
             return
-        was_active = self.scan_active
-        if was_active:
-            self._stop_mode_listener()
         config.save_selection_mode(mode)
         self.selection_mode = mode
         if self.window:
             self.window.log(f"Selection mode set to: {self._MODE_NAMES.get(mode, mode)}")
-        if was_active:
-            self._start_mode_listener()
 
     def calibrate_grid(self) -> None:
         if self.window is None:
@@ -192,8 +168,9 @@ class App:
                 f"Grid calibrated: {grid['rows']}x{grid['cols']} slots, "
                 f"band {grid['band_w']}x{grid['band_h']}px."
             )
-            if self.scan_active and self.selection_mode == "grid":
-                self.window.show_grid_outline(pipeline.grid_slot_rects(grid))
+            # Flash the calibrated outline briefly as confirmation, then let it
+            # fade out on its own - it's no longer kept on screen while scanning.
+            self.window.flash_grid_outline(pipeline.grid_slot_rects(grid))
 
     _ENGINE_NAMES = {
         "easyocr": "EasyOCR (accurate, slower)",
@@ -263,10 +240,111 @@ class App:
         if self.window:
             self.window.open_search()
 
+    def on_clear_overlays(self) -> None:
+        # Global "clear the screen" hotkey: wipe every on-screen result label /
+        # grid outline. Works any time (not gated on scan mode) so it's a
+        # reliable panic-clear when labels are covering something in-game.
+        if self._capturing_hotkey:
+            return
+        if self.window:
+            self.window.clear_overlays()
+            self.window.log("Cleared on-screen overlays.")
+
+    # --- world-state Display HUD ----------------------------------------
+    def on_display_toggle(self) -> None:
+        # Display hotkey / Show-Hide button: flip the world-state HUD.
+        if self._capturing_hotkey:
+            return
+        if self._display_active:
+            self._stop_display()
+        else:
+            self._start_display()
+
+    def _start_display(self) -> None:
+        if not self.display_enabled:
+            if self.window:
+                self.window.log("Tick a cycle in the Tracking tab first.")
+            return
+        self._display_active = True
+        if self.window:
+            self.window.configure_display(self.display_enabled, config.DISPLAY_POSITIONS)
+            self.window.show_display()
+            self.window.set_display_status("On (loading…)")
+            self.window.log("Tracking on.")
+        # Fetch cycle data now, then keep it fresh on a background loop.
+        self._display_stop = threading.Event()
+        threading.Thread(target=self._display_worker, args=(self._display_stop,), daemon=True).start()
+
+    def _stop_display(self) -> None:
+        self._display_active = False
+        self._display_stop.set()
+        if self.window:
+            self.window.hide_display()
+            self.window.set_display_status("Off")
+            self.window.log("Tracking off.")
+
+    def _display_worker(self, stop: threading.Event) -> None:
+        """Refresh cycle data every WORLDSTATE_REFRESH_SECONDS while the HUD is
+        up. The overlay ticks the countdown locally each second; this only needs
+        to catch a phase flip and the initial load. Reads self.display_enabled
+        fresh each pass so ticking a checkbox is picked up without a restart."""
+        while not stop.is_set():
+            keys = list(self.display_enabled)
+            states = worldstate.fetch_states(keys)
+            if stop.is_set():
+                return
+            if self.window:
+                self.window.update_display_data(states)
+                offline = (not states) or any(not s.ok for s in states.values())
+                self.window.set_display_status("On (offline?)" if offline else "On")
+            stop.wait(config.WORLDSTATE_REFRESH_SECONDS)
+
+    def set_display_item(self, key: str, enabled: bool) -> None:
+        chosen = set(self.display_enabled)
+        chosen.add(key) if enabled else chosen.discard(key)
+        # Keep the registry's display order rather than tick order.
+        self.display_enabled = [k for k in worldstate.DISPLAY_ITEM_ORDER if k in chosen]
+        config.save_display_enabled(self.display_enabled)
+        if self.window and self._display_active:
+            # Reflect the add/remove immediately, and pull data for a new item.
+            self.window.configure_display(self.display_enabled, config.DISPLAY_POSITIONS)
+            self._fetch_display_async()
+
+    def start_display_edit(self) -> None:
+        if not self.display_enabled:
+            if self.window:
+                self.window.log("Tick a cycle in the Tracking tab first, then edit its position.")
+            return
+        if self.window:
+            self.window.configure_display(self.display_enabled, config.DISPLAY_POSITIONS)
+            self.window.start_display_edit()
+            self.window.log("Edit layout: drag each card, Enter to save, Esc to cancel.")
+        # Populate real phases/icons for the edit view in the background.
+        self._fetch_display_async()
+
+    def save_display_layout(self, positions: dict) -> None:
+        config.save_display_positions(positions)
+        if self.window:
+            self.window.configure_display(self.display_enabled, config.DISPLAY_POSITIONS)
+            self.window.log("Tracking layout saved.")
+            if self._display_active:
+                self.window.show_display()  # return to the live, click-through HUD
+
+    def _fetch_display_async(self) -> None:
+        def run() -> None:
+            try:
+                states = worldstate.fetch_states(list(self.display_enabled))
+            except Exception:
+                log.exception("World-state fetch failed")
+                return
+            if self.window:
+                self.window.update_display_data(states)
+        threading.Thread(target=run, daemon=True).start()
+
     # --- hotkeys ---------------------------------------------------------
     _HK_ACTION_LABELS = {
-        "toggle": "Toggle scan mode", "scan": "Scan now",
-        "search": "Open search", "quit": "Quit",
+        "scan": "Scan now", "search": "Open search",
+        "clear": "Clear overlays", "display": "Toggle tracking", "quit": "Quit",
     }
 
     def begin_hotkey_capture(self) -> None:
@@ -293,9 +371,10 @@ class App:
 
         current = {
             "scan": config.HOTKEY_SCAN,
-            "toggle": config.HOTKEY_TOGGLE_SCAN,
             "quit": config.HOTKEY_QUIT,
             "search": config.HOTKEY_SEARCH,
+            "clear": config.HOTKEY_CLEAR,
+            "display": config.HOTKEY_DISPLAY,
         }
         for other, existing in current.items():
             if other != action and existing == hotkey:
@@ -308,8 +387,8 @@ class App:
 
         current[action] = hotkey
         config.save_hotkeys(
-            scan=current["scan"], toggle=current["toggle"],
-            quit_=current["quit"], search=current["search"],
+            scan=current["scan"], quit_=current["quit"],
+            search=current["search"], clear=current["clear"], display=current["display"],
         )
         if self.hotkeys is not None:
             try:
@@ -326,7 +405,7 @@ class App:
     def on_quit(self) -> None:
         if self._capturing_hotkey:
             return
-        self._stop_mode_listener()
+        self._display_stop.set()  # stop the world-state refresh loop
         if self.window:
             self.window.log("Quitting...")
         if self.icon:
@@ -337,27 +416,6 @@ class App:
     def show_window(self) -> None:
         if self.window:
             self.window.show()
-
-    # --- internals -------------------------------------------------------
-    def _refresh_icon(self) -> None:
-        if self.icon:
-            self.icon.icon = tray_mod.make_icon_image(self.scan_active)
-
-    # --- mode-aware start/stop: dispatches to whichever selection mode is
-    # currently active whenever scan mode is toggled on/off, or the mode
-    # itself is switched while scan mode is already on. ---------------------
-    def _start_mode_listener(self) -> None:
-        # Multi-Select and Relic are both triggered on demand by the scan
-        # hotkey, so there's nothing persistent to arm and the mouse stays
-        # yours until you ask for a scan. Grid just shows its calibrated
-        # outline so alignment can be confirmed before scanning.
-        if self.selection_mode == "grid":
-            if self.window and config.GRID is not None:
-                self.window.show_grid_outline(pipeline.grid_slot_rects(config.GRID))
-
-    def _stop_mode_listener(self) -> None:
-        if self.window:
-            self.window.hide_grid_outline()
 
     def start_multi_select(self) -> None:
         """Arm ONE Multi-Select region pick. The overlay captures the mouse for
@@ -462,11 +520,6 @@ class App:
         except Exception:
             log.exception("Grid scan capture failed")
             return
-        finally:
-            # capture_hidden withdrew the grid outline; bring it back for the
-            # next scan while scan mode stays on.
-            if self.window and self.scan_active and self.selection_mode == "grid":
-                self.window.show_grid_outline(rects)
 
         found = 0
 
@@ -635,10 +688,6 @@ class App:
         menu = pystray.Menu(
             pystray.MenuItem("Show window", lambda: self.show_window(), default=True),
             pystray.MenuItem(
-                lambda _i: f"Toggle scan mode ({gui.hotkey_label(config.HOTKEY_TOGGLE_SCAN)})",
-                lambda: self.on_toggle_scan(),
-            ),
-            pystray.MenuItem(
                 lambda _i: f"Scan now ({gui.hotkey_label(config.HOTKEY_SCAN)})",
                 lambda: self.on_scan(),
             ),
@@ -647,7 +696,7 @@ class App:
                 lambda: self.on_quit(),
             ),
         )
-        self.icon = pystray.Icon("wf_pricer", tray_mod.make_icon_image(False), "WF-PriceTracker", menu)
+        self.icon = pystray.Icon("wf_pricer", tray_mod.make_icon_image(), "WF-PriceTracker", menu)
         return self.icon
 
 
@@ -659,7 +708,6 @@ def main() -> None:
     app = App()
 
     window = gui.AppWindow(
-        on_toggle_scan=app.on_toggle_scan,
         on_scan_now=app.on_scan,
         on_refresh_catalog=app.refresh_catalog,
         on_engine_change=app.set_engine,
@@ -674,9 +722,14 @@ def main() -> None:
         on_calibrate_relic=app.calibrate_relic_region,
         on_clear_relic_region=app.clear_relic_region,
         on_color_filter_change=app.set_color_filter,
+        on_display_item_change=app.set_display_item,
+        on_display_toggle=app.on_display_toggle,
+        on_display_edit=app.start_display_edit,
+        on_display_layout_saved=app.save_display_layout,
         on_quit=app.on_quit,
     )
     app.window = window
+    window.configure_display(config.DISPLAY_ENABLED, config.DISPLAY_POSITIONS)
     window.set_engine_selection(config.OCR_ENGINE)
     window.set_selection_mode_selection(config.SELECTION_MODE)
     window.set_price_workers(config.PRICE_FETCH_WORKERS)
@@ -701,8 +754,9 @@ def main() -> None:
         window.log("(First EasyOCR run will download its model weights - needs internet, one-time.)")
 
     hotkeys = scan.HotkeyListener(
-        on_scan=app.on_scan, on_toggle_scan=app.on_toggle_scan,
-        on_quit=app.on_quit, on_search=app.open_search,
+        on_scan=app.on_scan, on_quit=app.on_quit,
+        on_search=app.open_search, on_clear=app.on_clear_overlays,
+        on_display=app.on_display_toggle,
     )
     app.hotkeys = hotkeys  # so rebinds can restart it
     hotkeys.start()

@@ -1,16 +1,22 @@
-"""Quick validation script for the matching-accuracy + performance changes."""
+"""Validation for the matching-accuracy rules (anchored fuzzy match, ambiguity
+refusal, UI/OCR-artifact rejection).
+
+Runnable two ways:
+  * as a script:  python tests/test_matching.py   (verbose PASS/FAIL report)
+  * under pytest: pytest                           (collected as test_matching)
+
+It matches against the live item catalog cached on disk (config.ITEMS_CACHE_FILE);
+if that cache doesn't exist yet (fresh clone, catalog never fetched), the pytest
+test skips rather than failing. Requires the package to be importable - install
+it first with `pip install -e .`.
+"""
 from __future__ import annotations
 
 import json
 import logging
-import sys
-from dataclasses import dataclass
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from wf_pricer.items_db import ItemsIndex, _reject_query, normalize_name, Item
 from wf_pricer import config
+from wf_pricer.items_db import Item, ItemsIndex, _reject_query
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -59,6 +65,31 @@ def load_catalog() -> ItemsIndex:
     return ItemsIndex(items)
 
 
+def _failures(idx: ItemsIndex) -> list[tuple[str, str | None, object]]:
+    """Cases whose match result doesn't equal the expectation (None/'AMBIG'
+    both mean 'no match')."""
+    out = []
+    for text, expected in TEST_CASES:
+        result = idx.match(text)
+        name = result.name if result else None
+        ok = (name is None) if expected in (None, "AMBIG") else (name == expected)
+        if not ok:
+            out.append((text, name, expected))
+    return out
+
+
+def test_matching() -> None:
+    """pytest entry point: skips cleanly if the catalog hasn't been cached yet."""
+    import pytest
+
+    if not config.ITEMS_CACHE_FILE.exists():
+        pytest.skip(f"item catalog not cached at {config.ITEMS_CACHE_FILE}; run the app once")
+    failures = _failures(load_catalog())
+    assert not failures, "matching regressions: " + "; ".join(
+        f"{t!r} -> {g!r} (expected {e!r})" for t, g, e in failures
+    )
+
+
 def main() -> None:
     log.info("Loading %d items from %s ...", len(json.loads(config.ITEMS_CACHE_FILE.read_text(encoding="utf-8"))["items"]), config.ITEMS_CACHE_FILE)
     idx = load_catalog()
@@ -91,7 +122,7 @@ def main() -> None:
 
     log.info("\nResults: %d passed, %d failed out of %d", passed, failed, len(TEST_CASES))
     if failed:
-        sys.exit(1)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

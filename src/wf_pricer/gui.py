@@ -2,7 +2,7 @@
 
 Tkinter isn't thread-safe, so every widget mutation has to happen on the Tk
 thread. Other threads (the pynput hotkey thread, the background scan-worker
-thread) only ever call the thread-safe methods here (log/set_scan_active/etc),
+thread) only ever call the thread-safe methods here (log/set_status/etc),
 which either push onto a queue.Queue the Tk mainloop polls, or schedule a
 callback via root.after(0, ...).
 """
@@ -18,8 +18,11 @@ from typing import Callable
 from PIL import Image
 from pynput import keyboard
 
-from . import config
-from .scan import force_foreground, grab_virtual_screen, primary_screen_size, virtual_screen_rect
+from . import config, glyphs, worldstate
+from .scan import (
+    force_foreground, grab_virtual_screen, primary_screen_size,
+    set_clickthrough, virtual_screen_rect,
+)
 
 log = logging.getLogger(__name__)
 
@@ -135,19 +138,20 @@ class AppWindow:
         ("tesseract", "Tesseract (fast, local)"),
     ]
 
-    # The tab strip. The first three are scan modes; "settings" is a plain
-    # page (see _active_tab). Kept in one list so they render as one strip.
+    # The tab strip. The first three are scan modes; "display" and "settings"
+    # are plain pages (see _active_tab), not scan modes. Kept in one list so
+    # they render as one strip.
     _TAB_DEFS = [
         ("multi", "Multi"),
         ("grid", "Grid"),
         ("relic", "Relic"),
+        ("display", "Tracking"),
         ("settings", "Settings"),
     ]
     _MODE_TABS = ("multi", "grid", "relic")
 
     def __init__(
         self,
-        on_toggle_scan: Callable[[], None],
         on_scan_now: Callable[[], None],
         on_refresh_catalog: Callable[[], None],
         on_engine_change: Callable[[str], None],
@@ -162,6 +166,10 @@ class AppWindow:
         on_calibrate_relic: Callable[[], None],
         on_clear_relic_region: Callable[[], None],
         on_color_filter_change: Callable[[bool, tuple, int], None],
+        on_display_item_change: Callable[[str, bool], None],
+        on_display_toggle: Callable[[], None],
+        on_display_edit: Callable[[], None],
+        on_display_layout_saved: Callable[[dict], None],
         on_quit: Callable[[], None],
     ) -> None:
         self._log_queue: "queue.Queue[str]" = queue.Queue()
@@ -177,7 +185,7 @@ class AppWindow:
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.status_var = tk.StringVar(value="Idle")
+        self.status_var = tk.StringVar(value="Ready")
         self.grid_info_var = tk.StringVar(value="Not calibrated")
         self.topmost_var = tk.BooleanVar(value=False)
         self.engine_var = tk.StringVar()
@@ -209,12 +217,15 @@ class AppWindow:
         # the labels are right on first paint, before main pushes anything.
         self._hk_labels = {
             "scan": hotkey_label(config.HOTKEY_SCAN),
-            "toggle": hotkey_label(config.HOTKEY_TOGGLE_SCAN),
             "quit": hotkey_label(config.HOTKEY_QUIT),
             "search": hotkey_label(config.HOTKEY_SEARCH),
+            "clear": hotkey_label(config.HOTKEY_CLEAR),
+            "display": hotkey_label(config.HOTKEY_DISPLAY),
         }
+        # Display HUD state
+        self.display_status_var = tk.StringVar(value="Off")
+        self._display_vars: dict[str, tk.BooleanVar] = {}
         self._hk_vars = {k: tk.StringVar(value=v) for k, v in self._hk_labels.items()}
-        self._scan_active = False
         # Manual item search (magnifier button in the header).
         self._search_visible = False
         self._search_index: list[tuple[str, str, str]] = []  # (name, slug, lowercased name)
@@ -223,7 +234,6 @@ class AppWindow:
         self._sugg_index = -1
         self._quick_search: "QuickSearchPopup | None" = None  # the hotkey pop-up
 
-        self._on_toggle_scan = on_toggle_scan
         self._on_scan_now = on_scan_now
         self._on_refresh_catalog = on_refresh_catalog
         self._on_engine_change = on_engine_change
@@ -238,6 +248,10 @@ class AppWindow:
         self._on_calibrate_relic = on_calibrate_relic
         self._on_clear_relic_region = on_clear_relic_region
         self._on_color_filter_change = on_color_filter_change
+        self._on_display_item_change = on_display_item_change
+        self._on_display_toggle = on_display_toggle
+        self._on_display_edit = on_display_edit
+        self._on_display_layout_saved = on_display_layout_saved
         self._on_quit = on_quit
 
         self._init_style()
@@ -248,6 +262,7 @@ class AppWindow:
         self._multi_result_overlay = MultiResultOverlay(self.root)
         self._grid_outline_overlay = GridOutlineOverlay(self.root)
         self._color_picker_overlay = ColorPickerOverlay(self.root)
+        self._world_overlay = WorldStateOverlay(self.root, on_layout_saved=on_display_layout_saved)
 
     # --- theme ------------------------------------------------------------
     def _init_style(self) -> None:
@@ -501,11 +516,12 @@ class AppWindow:
         search_hint.pack(side="left", padx=(4, 0))
         search_hint.bind("<Button-1>", lambda _e: self._toggle_search())
 
-        # Status reads as a pill: a coloured dot plus the text, so scan state
-        # is legible at a glance from across the screen.
+        # Status reads as a pill: a coloured dot plus the active mode's name, so
+        # what the scan hotkey will do is legible at a glance from across the
+        # screen (updated by _apply_mode_controls).
         pill = tk.Frame(header, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
         pill.pack(side="right")
-        self.status_dot = tk.Label(pill, text="●", bg=SURFACE, fg=TEXT_DIM, font=(FONT, 9))
+        self.status_dot = tk.Label(pill, text="●", bg=SURFACE, fg=ACCENT, font=(FONT, 9))
         self.status_dot.pack(side="left", padx=(8, 4), pady=3)
         tk.Label(
             pill, textvariable=self.status_var, bg=SURFACE, fg=TEXT, font=(FONT, 9, "bold")
@@ -698,6 +714,7 @@ class AppWindow:
         self._panels["multi"] = self._build_multi_panel()
         self._panels["grid"] = self._build_grid_panel()
         self._panels["relic"] = self._build_relic_panel()
+        self._panels["display"] = self._build_display_panel()
         self._panels["settings"] = self._build_settings_panel()
 
     def _panel_body(self, blurb: str) -> tuple[tk.Frame, tk.Frame]:
@@ -786,33 +803,68 @@ class AppWindow:
         self._stat_row(body, "Reward area:", self.relic_info_var)
         return card
 
+    def _build_display_panel(self) -> tk.Frame:
+        card, body = self._panel_body(
+            "Tick the world-state cycles you want on screen, then press the Tracking "
+            "hotkey (or Show / Hide) to toggle them over the game. Use Edit Layout to "
+            "drag each card where you want it — positions are saved. The overlay is "
+            "click-through, so it never gets in the way of playing."
+        )
+        for key in worldstate.DISPLAY_ITEM_ORDER:
+            var = tk.BooleanVar(value=key in config.DISPLAY_ENABLED)
+            self._display_vars[key] = var
+            tk.Checkbutton(
+                body, text=worldstate.item_label(key), variable=var,
+                command=lambda k=key: self._on_display_item_toggle(k),
+                bg=SURFACE, fg=TEXT, selectcolor=SURFACE_HI, activebackground=SURFACE,
+                activeforeground=TEXT, font=(FONT, 9), relief="flat", bd=0,
+                highlightthickness=0, cursor="hand2", anchor="w",
+            ).pack(fill="x", pady=(2, 0))
+
+        btn_row = tk.Frame(body, bg=SURFACE)
+        btn_row.pack(fill="x", pady=(12, 0))
+        self.display_toggle_btn = self._button(
+            btn_row, self._display_btn_text(), lambda: self._on_display_toggle(),
+            side="left", expand=True, fill="x", padx=(0, 5),
+        )
+        self._button(
+            btn_row, "Edit Layout…", lambda: self._on_display_edit(),
+            side="left", expand=True, fill="x", padx=(5, 0),
+        )
+        self._stat_row(body, "Status:", self.display_status_var)
+        return card
+
+    def _display_btn_text(self) -> str:
+        # The show/hide button carries the (rebindable) Tracking hotkey.
+        return f"Show / Hide ({self._hk_labels['display']})"
+
+    def _on_display_item_toggle(self, key: str) -> None:
+        self._on_display_item_change(key, self._display_vars[key].get())
+
     def _build_actions(self, parent: tk.Misc) -> None:
+        # One primary action: the scan hotkey works on demand (no scan mode to
+        # arm), so this button just does whatever the current mode needs.
         actions = tk.Frame(parent, bg=BG)
         actions.pack(fill="x", padx=16, pady=(12, 0))
         self._actions_frame = actions  # hidden on the Settings tab
-        self.toggle_btn = self._button(
-            actions, self._toggle_btn_text(), self._on_toggle_scan, primary=True,
-            side="left", expand=True, fill="x", padx=(0, 5),
-        )
         self.scan_now_btn = self._button(
-            actions, self._scan_btn_text(), self._on_scan_now,
-            side="left", expand=True, fill="x", padx=(5, 0),
+            actions, self._scan_btn_text(), self._on_scan_now, primary=True,
+            side="left", expand=True, fill="x",
         )
-
-    def _toggle_btn_text(self) -> str:
-        verb = "Stop" if self._scan_active else "Start"
-        return f"{verb} Scan Mode ({self._hk_labels['toggle']})"
 
     def _scan_btn_text(self) -> str:
-        # In Multi-Select the same action arms a one-shot area pick rather than
+        # In Multi-Select the action arms a one-shot area pick rather than
         # scanning immediately, so the button says what it actually does.
         verb = "Select Area" if self.selection_mode_var.get() == "multi" else "Scan Now"
         return f"{verb} ({self._hk_labels['scan']})"
 
     _HK_ACTION_NAMES = {
-        "toggle": "Toggle scan mode", "scan": "Scan now",
-        "search": "Open search", "quit": "Quit app",
+        "scan": "Scan now", "search": "Open search",
+        "clear": "Clear overlays", "display": "Toggle tracking", "quit": "Quit app",
     }
+
+    # Pill text per selection mode (what the scan hotkey will do right now).
+    _MODE_STATUS = {"multi": "Multi-Select", "grid": "Grid Scan", "relic": "Relic Reward"}
 
     def _settings_subhead(self, parent: tk.Misc, text: str, first: bool = False) -> None:
         """A divider + small caps heading to group the settings card into
@@ -928,7 +980,7 @@ class AppWindow:
 
         # --- Hotkeys ---
         self._settings_subhead(body, "Hotkeys")
-        for action in ("toggle", "scan", "search", "quit"):
+        for action in ("scan", "search", "clear", "display", "quit"):
             self._hotkey_row(body, action)
 
         # --- Catalog ---
@@ -1032,8 +1084,8 @@ class AppWindow:
         self.call_soon(_set)
 
     def _apply_active_tab(self, tab: str) -> None:
-        """Highlight `tab`, show only its panel, and hide the scan action bar
-        on the Settings tab (those buttons are scan controls, not config)."""
+        """Highlight `tab`, show only its panel, and hide the scan action bar on
+        non-scan tabs (Display / Settings) - those buttons are scan controls."""
         self._active_tab = tab
         for k, (label, underline) in self._tabs.items():
             selected = k == tab
@@ -1045,7 +1097,7 @@ class AppWindow:
             else:
                 panel.pack_forget()
 
-        if tab == "settings":
+        if tab not in self._MODE_TABS:
             self._actions_frame.pack_forget()
         elif not self._actions_frame.winfo_ismapped():
             self._actions_frame.pack(fill="x", padx=16, pady=(12, 0), before=self._activity_anchor)
@@ -1057,20 +1109,19 @@ class AppWindow:
         self._schedule_reflow()
 
     def _apply_mode_controls(self, mode: str) -> None:
-        """Scan-now enablement and the footer hint follow the active SCAN MODE
-        (not the visible tab), so they stay correct while the Settings tab is
-        open."""
+        """The status pill, action button and footer hint follow the active
+        SCAN MODE (not the visible tab), so they stay correct while the Settings
+        tab is open."""
         if mode == "grid":
             action = f"{self._hk_labels['scan']} scan grid"
         elif mode == "relic":
             action = f"{self._hk_labels['scan']} scan rewards"
         else:  # multi
             action = f"{self._hk_labels['scan']} select area"
-        # Every mode now has a scan-hotkey action (Multi's arms an area pick).
-        self._set_button_enabled(self.scan_now_btn, True)
+        self.status_var.set(self._MODE_STATUS.get(mode, "Ready"))
         self.scan_now_btn.config(text=self._scan_btn_text())
         self.hint_var.set(
-            f"{self._hk_labels['toggle']} toggle   ·   {action}   ·   {self._hk_labels['quit']} quit"
+            f"{action}   ·   {self._hk_labels['clear']} clear   ·   {self._hk_labels['quit']} quit"
         )
 
     def _on_price_workers_scale(self, raw: str) -> None:
@@ -1273,23 +1324,10 @@ class AppWindow:
     def set_grid_info_label(self, text: str) -> None:
         self.call_soon(lambda: self.grid_info_var.set(text))
 
-    def set_scan_active(self, active: bool) -> None:
-        """Reflect scan-mode on/off across the status pill and the primary
-        button's label (Start/Stop + the current toggle hotkey). Thread-safe.
-        """
-
-        def _set() -> None:
-            self._scan_active = active
-            self.status_var.set("Scan mode ON" if active else "Idle")
-            self.status_dot.config(fg=ACCENT if active else TEXT_DIM)
-            self.toggle_btn.config(text=self._toggle_btn_text())
-
-        self.call_soon(_set)
-
     def set_hotkey_labels(self, labels: dict) -> None:
-        """Update the shown hotkey bindings (a dict of any of scan/toggle/quit
-        -> pretty label) after a rebind, and refresh everything derived from
-        them: the settings rows, the two action buttons, the footer hint.
+        """Update the shown hotkey bindings (a dict of any of scan/search/clear/
+        quit -> pretty label) after a rebind, and refresh everything derived
+        from them: the settings rows, the action button, the footer hint.
         Thread-safe.
         """
 
@@ -1298,8 +1336,9 @@ class AppWindow:
             for action, pretty in labels.items():
                 if action in self._hk_vars:
                     self._hk_vars[action].set(pretty)
-            self.toggle_btn.config(text=self._toggle_btn_text())
             self.scan_now_btn.config(text=self._scan_btn_text())
+            if hasattr(self, "display_toggle_btn"):
+                self.display_toggle_btn.config(text=self._display_btn_text())
             self._apply_mode_controls(self.selection_mode_var.get())
 
         self.call_soon(_set)
@@ -1416,12 +1455,44 @@ class AppWindow:
         }
         on_complete(grid)
 
-    # --- grid outline preview (fixed rects shown while Grid Scan mode is on)
-    def show_grid_outline(self, rects: list[tuple[int, int, int, int]]) -> None:
-        self.call_soon(lambda: self._grid_outline_overlay.show(rects))
+    # --- grid outline preview (flashed briefly after calibration, then fades)
+    def flash_grid_outline(self, rects: list[tuple[int, int, int, int]]) -> None:
+        self.call_soon(lambda: self._grid_outline_overlay.show(rects, autofade=True))
 
     def hide_grid_outline(self) -> None:
         self.call_soon(lambda: self._grid_outline_overlay.hide())
+
+    # --- panic clear: wipe every on-screen label/outline over the game -----
+    def clear_overlays(self) -> None:
+        """Remove all on-screen overlay labels: the multi-select/grid/relic
+        result labels and the grid outline (cancelling a fade in progress).
+        Fired by the global clear hotkey, so it's thread-safe. Leaves an active
+        selection drag / colour-picker alone - those are dismissed with Esc."""
+
+        def _clear() -> None:
+            self._multi_result_overlay.clear()
+            self._grid_outline_overlay.hide()
+
+        self.call_soon(_clear)
+
+    # --- world-state Display HUD (thread-safe proxies to the overlay) -------
+    def configure_display(self, enabled: list[str], positions: dict) -> None:
+        self.call_soon(lambda: self._world_overlay.set_layout(enabled, positions))
+
+    def show_display(self) -> None:
+        self.call_soon(self._world_overlay.show)
+
+    def hide_display(self) -> None:
+        self.call_soon(self._world_overlay.hide)
+
+    def update_display_data(self, states: dict) -> None:
+        self.call_soon(lambda: self._world_overlay.set_states(states))
+
+    def start_display_edit(self) -> None:
+        self.call_soon(self._world_overlay.start_edit)
+
+    def set_display_status(self, text: str) -> None:
+        self.call_soon(lambda: self.display_status_var.set(text))
 
     # --- hide ourselves during a screen grab -----------------------------
     # Our result labels, grid outline, cursor box and even the main window
@@ -1702,11 +1773,18 @@ class MultiResultOverlay(tk.Toplevel):
 
 class GridOutlineOverlay(tk.Toplevel):
     """Draws a set of fixed rectangles (the calibrated grid's slot name bands)
-    over the screen so the user can confirm the grid lines up before scanning.
-    Shown while Grid Scan mode + scan mode are both on; purely a preview.
+    over the screen so the user can confirm the grid lines up.
+
+    It's no longer parked on screen while scanning - show(..., autofade=True)
+    flashes the outline briefly (right after calibration) then fades it out on
+    its own, so it doesn't linger over the game.
     """
 
     _TRANSPARENT_KEY = "#010203"
+    # Flash timing: hold fully visible, then step the window alpha down to zero.
+    _HOLD_MS = 2200        # stays fully opaque this long before fading
+    _FADE_TICK_MS = 55     # gap between fade steps
+    _FADE_STEP = 0.06      # alpha removed per step (~1s from full to gone)
 
     def __init__(self, parent: tk.Misc) -> None:
         super().__init__(parent)
@@ -1722,13 +1800,32 @@ class GridOutlineOverlay(tk.Toplevel):
         self.canvas = tk.Canvas(self, bg=self._TRANSPARENT_KEY, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self._rect_ids: list[int] = []
+        self._fade_job: str | None = None
 
     def _refresh_geometry(self) -> None:
         left, top, width, height = virtual_screen_rect()
         self.geometry(f"{width}x{height}+{left}+{top}")
         self._offset = (left, top)
 
-    def show(self, rects: list[tuple[int, int, int, int]]) -> None:
+    def _set_alpha(self, value: float) -> bool:
+        try:
+            self.attributes("-alpha", value)
+            return True
+        except tk.TclError:
+            return False
+
+    def _cancel_fade(self) -> None:
+        if self._fade_job is not None:
+            try:
+                self.after_cancel(self._fade_job)
+            except tk.TclError:
+                pass
+            self._fade_job = None
+
+    def show(self, rects: list[tuple[int, int, int, int]], autofade: bool = False) -> None:
+        # A fresh show cancels any fade still running from a previous flash and
+        # resets the window back to fully opaque.
+        self._cancel_fade()
         self._refresh_geometry()
         for rid in self._rect_ids:
             self.canvas.delete(rid)
@@ -1739,14 +1836,28 @@ class GridOutlineOverlay(tk.Toplevel):
                 x - ox, y - oy, x - ox + w, y - oy + h, outline=ACCENT, width=1
             )
             self._rect_ids.append(rid)
+        self._set_alpha(1.0)
         self.deiconify()
         self.lift()
+        if autofade:
+            self._fade_job = self.after(self._HOLD_MS, lambda: self._fade(1.0))
+
+    def _fade(self, alpha: float) -> None:
+        alpha -= self._FADE_STEP
+        # Stop (and fully hide) once transparent, or if this platform's Tk
+        # can't animate window alpha at all - then it just blinks off.
+        if alpha <= 0 or not self._set_alpha(alpha):
+            self.hide()
+            return
+        self._fade_job = self.after(self._FADE_TICK_MS, lambda: self._fade(alpha))
 
     def hide(self) -> None:
+        self._cancel_fade()
         for rid in self._rect_ids:
             self.canvas.delete(rid)
         self._rect_ids.clear()
         self.withdraw()
+        self._set_alpha(1.0)  # reset so a later show() starts fully opaque
 
 
 class ColorPickerOverlay(tk.Toplevel):
@@ -2225,3 +2336,214 @@ class QuickSearchPopup(tk.Toplevel):
             self.destroy()
         except tk.TclError:
             pass
+
+
+class WorldStateOverlay(tk.Toplevel):
+    """The Tracking HUD: draws a small card (icon + place + phase + countdown)
+    for each ticked world-state cycle at its saved on-screen position.
+
+    While showing it is CLICK-THROUGH (WS_EX_TRANSPARENT via scan.set_click-
+    through), so it sits over the game without ever eating a click, and a 1s
+    tick redraws the countdowns locally from each cycle's expiry. Edit-layout
+    mode turns click-through off, dims the screen, and lets each card be
+    dragged; Enter saves the new positions (on_layout_saved), Esc cancels.
+    """
+
+    _TRANSPARENT_KEY = "#010203"
+    _CARD_W = 186
+    _CARD_H = 56
+    _ICON = 40
+
+    def __init__(self, parent: tk.Misc, on_layout_saved: Callable[[dict], None]) -> None:
+        super().__init__(parent)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-transparentcolor", self._TRANSPARENT_KEY)
+        except tk.TclError:
+            pass
+
+        self._on_layout_saved = on_layout_saved
+        self._offset = (0, 0)
+        self._enabled: list[str] = []
+        self._positions: dict[str, tuple[int, int]] = {}
+        self._states: dict[str, worldstate.CycleState] = {}
+        self._photos: dict[tuple[str, int], object] = {}
+        self._card_boxes: dict[str, tuple[int, int, int, int]] = {}  # canvas coords, for hit-test
+        self._edit = False
+        self._drag: tuple[str, int, int] | None = None
+        self._tick_job: str | None = None
+        self._ImageTk = None
+
+        self.canvas = tk.Canvas(self, bg=self._TRANSPARENT_KEY, highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Button-1>", self._edit_press)
+        self.canvas.bind("<B1-Motion>", self._edit_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._edit_release)
+        self.bind("<Return>", lambda _e: self._finish_edit(save=True))
+        self.bind("<Escape>", lambda _e: self._finish_edit(save=False))
+
+    # --- state in ---------------------------------------------------------
+    def set_layout(self, enabled: list[str], positions: dict) -> None:
+        self._enabled = list(enabled)
+        self._positions = {k: (int(v[0]), int(v[1])) for k, v in positions.items()}
+        if self.winfo_viewable():
+            self._draw()
+
+    def set_states(self, states: dict) -> None:
+        self._states = dict(states)
+        if self.winfo_viewable():
+            self._draw()
+
+    # --- show / hide ------------------------------------------------------
+    def show(self) -> None:
+        self._edit = False
+        self._refresh_geometry()
+        self._draw()
+        self.deiconify()
+        self.lift()
+        self.update_idletasks()
+        set_clickthrough(self, True)
+        self._start_tick()
+
+    def hide(self) -> None:
+        self._stop_tick()
+        self.withdraw()
+
+    def _refresh_geometry(self) -> None:
+        left, top, width, height = virtual_screen_rect()
+        self.geometry(f"{width}x{height}+{left}+{top}")
+        self._offset = (left, top)
+
+    def _start_tick(self) -> None:
+        self._stop_tick()
+        self._tick_job = self.after(1000, self._tick)
+
+    def _tick(self) -> None:
+        if self._edit or not self.winfo_viewable():
+            self._tick_job = None
+            return
+        self._draw()
+        self._tick_job = self.after(1000, self._tick)
+
+    def _stop_tick(self) -> None:
+        if self._tick_job is not None:
+            try:
+                self.after_cancel(self._tick_job)
+            except tk.TclError:
+                pass
+            self._tick_job = None
+
+    # --- drawing ----------------------------------------------------------
+    def _pos(self, key: str) -> tuple[int, int]:
+        """Screen position of a card: the saved one, or a default vertical
+        stack near the top-left for a ticked item that's never been placed."""
+        if key in self._positions:
+            return self._positions[key]
+        idx = self._enabled.index(key) if key in self._enabled else 0
+        left, top, _w, _h = virtual_screen_rect()
+        return (left + 40, top + 40 + idx * (self._CARD_H + 12))
+
+    def _icon_photo(self, icon: str):
+        cache_key = (icon, self._ICON)
+        photo = self._photos.get(cache_key)
+        if photo is None:
+            if self._ImageTk is None:
+                from PIL import ImageTk
+                self._ImageTk = ImageTk
+            photo = self._ImageTk.PhotoImage(glyphs.icon_image(icon, self._ICON))
+            self._photos[cache_key] = photo
+        return photo
+
+    def _draw(self) -> None:
+        self.canvas.delete("all")
+        self._card_boxes = {}
+        ox, oy = self._offset
+        if self._edit:
+            w, h = self.winfo_width(), self.winfo_height()
+            self.canvas.create_rectangle(0, 0, w, h, fill=BG, outline="", stipple="gray50")
+            self.canvas.create_text(
+                w // 2, 26, fill=TEXT, font=(FONT, 13, "bold"),
+                text="Drag each card where you want it    ·    Enter to save    ·    Esc to cancel",
+            )
+        for key in self._enabled:
+            sx, sy = self._pos(key)
+            self._draw_card(key, sx - ox, sy - oy)
+
+    def _draw_card(self, key: str, x: int, y: int) -> None:
+        state = self._states.get(key)
+        spec = worldstate.DISPLAY_ITEMS.get(key, {})
+        place = state.place if state else spec.get("place", key)
+        icon = state.icon if state else "⏳"  # ⏳ while loading
+        phase = state.phase_label if state else "…"
+        remaining = worldstate.format_remaining(state.expiry) if state else "…"
+
+        w, h = self._CARD_W, self._CARD_H
+        outline = ACCENT if self._edit else BORDER
+        self.canvas.create_rectangle(
+            x, y, x + w, y + h, fill=SURFACE, outline=outline,
+            width=2 if self._edit else 1, dash=(4, 3) if self._edit else (),
+        )
+        self.canvas.create_image(x + 8, y + h // 2, anchor="w", image=self._icon_photo(icon))
+        tx = x + 8 + self._ICON + 8
+        self.canvas.create_text(tx, y + 15, anchor="w", text=place, fill=ACCENT, font=(FONT, 11, "bold"))
+        self.canvas.create_text(
+            tx, y + 37, anchor="w", text=f"{phase}  ·  {remaining}", fill=TEXT, font=(FONT, 10)
+        )
+        self._card_boxes[key] = (x, y, x + w, y + h)
+
+    # --- edit-layout mode -------------------------------------------------
+    def start_edit(self) -> None:
+        self._stop_tick()
+        self._edit = True
+        self._refresh_geometry()
+        self._draw()
+        self.deiconify()
+        self.lift()
+        self.update_idletasks()
+        set_clickthrough(self, False)  # interactive: cards must catch the drag
+        force_foreground(self)
+        self.focus_force()
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _edit_press(self, event: tk.Event) -> None:
+        if not self._edit:
+            return
+        for key in reversed(self._enabled):  # top-most first
+            x0, y0, x1, y1 = self._card_boxes.get(key, (0, 0, 0, 0))
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                self._drag = (key, event.x - x0, event.y - y0)
+                return
+        self._drag = None
+
+    def _edit_motion(self, event: tk.Event) -> None:
+        if not self._edit or self._drag is None:
+            return
+        key, grab_dx, grab_dy = self._drag
+        w, h = self.winfo_width(), self.winfo_height()
+        nx = max(0, min(w - self._CARD_W, event.x - grab_dx))
+        ny = max(0, min(h - self._CARD_H, event.y - grab_dy))
+        ox, oy = self._offset
+        self._positions[key] = (nx + ox, ny + oy)  # stored as screen coords
+        self._draw()
+
+    def _edit_release(self, _event: tk.Event) -> None:
+        self._drag = None
+
+    def _finish_edit(self, save: bool) -> None:
+        if not self._edit:
+            return
+        self._edit = False
+        self._drag = None
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.withdraw()
+        if save:
+            positions = {k: [int(v[0]), int(v[1])] for k, v in self._positions.items() if k in self._enabled}
+            self._on_layout_saved(positions)

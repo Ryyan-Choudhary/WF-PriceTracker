@@ -85,6 +85,33 @@ def force_foreground(window) -> None:
         log.debug("force_foreground failed", exc_info=True)
 
 
+def set_clickthrough(window, enabled: bool) -> None:
+    """Make a Tk overlay window click-through (mouse passes to the game beneath)
+    or interactive again, by toggling the WS_EX_TRANSPARENT extended style.
+
+    The Display HUD sits on top of the game permanently, so while it's just
+    showing it must not eat clicks; in Edit-layout mode we turn this off so the
+    cards can be dragged. WS_EX_LAYERED is already set by Tk (it uses a layered
+    window for -transparentcolor), so we only flip the TRANSPARENT bit."""
+    try:
+        user32 = ctypes.windll.user32
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x00080000
+        WS_EX_TRANSPARENT = 0x00000020
+        GA_ROOT = 2
+        hwnd = user32.GetAncestor(int(window.winfo_id()), GA_ROOT)
+        if not hwnd:
+            return
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if enabled:
+            style |= WS_EX_LAYERED | WS_EX_TRANSPARENT
+        else:
+            style &= ~WS_EX_TRANSPARENT
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+    except Exception:
+        log.debug("set_clickthrough failed", exc_info=True)
+
+
 def grab_virtual_screen() -> tuple[Image.Image, tuple[int, int]]:
     """Grab the ENTIRE virtual desktop (all monitors) as one image, returning
     (image, (left, top)) where (left, top) is the desktop's top-left in screen
@@ -134,14 +161,16 @@ class HotkeyListener:
     def __init__(
         self,
         on_scan: Callable[[], None],
-        on_toggle_scan: Callable[[], None],
         on_quit: Callable[[], None],
         on_search: Callable[[], None],
+        on_clear: Callable[[], None],
+        on_display: Callable[[], None],
     ) -> None:
         self._on_scan = on_scan
-        self._on_toggle_scan = on_toggle_scan
         self._on_quit = on_quit
         self._on_search = on_search
+        self._on_clear = on_clear
+        self._on_display = on_display
         self._listener: keyboard.GlobalHotKeys | None = None
         self._build()
 
@@ -152,9 +181,10 @@ class HotkeyListener:
         self._listener = keyboard.GlobalHotKeys(
             {
                 config.HOTKEY_SCAN: self._on_scan,
-                config.HOTKEY_TOGGLE_SCAN: self._on_toggle_scan,
                 config.HOTKEY_QUIT: self._on_quit,
                 config.HOTKEY_SEARCH: self._on_search,
+                config.HOTKEY_CLEAR: self._on_clear,
+                config.HOTKEY_DISPLAY: self._on_display,
             }
         )
 

@@ -1,23 +1,62 @@
 """Central configuration for WF-PriceTracker.
 
 Tweak the values below to change hotkeys, folders, or matching thresholds.
-Nothing here talks to the network or the filesystem at import time except
-creating the data folders, so it's safe to import from anywhere.
+Nothing here talks to the network at import time; it only creates the per-user
+data folders (and migrates an older in-repo data/ dir on first run), so it's
+safe to import from anywhere.
 """
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import sys
 from pathlib import Path
 
+APP_NAME = "WF-PriceTracker"
+
+
+def _user_data_dir(app: str = APP_NAME) -> Path:
+    """Per-user, writable data directory following each OS's convention, so
+    runtime state lives outside the source tree (and works when the package is
+    pip-installed, where writing next to the code isn't possible):
+      Windows  %LOCALAPPDATA%\\<app>
+      macOS    ~/Library/Application Support/<app>
+      Linux    $XDG_DATA_HOME/<app>  (default ~/.local/share/<app>)
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
+    return Path(base) / app
+
+
 # --- Folders -----------------------------------------------------------
-ROOT_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT_DIR / "data"
+DATA_DIR = _user_data_dir()
 CACHE_DIR = DATA_DIR / "cache"
 LOGS_DIR = DATA_DIR / "logs"
 
 for _d in (CACHE_DIR, LOGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+
+def _migrate_legacy_data() -> None:
+    """One-time move of settings from the old in-repo data/cache (used before
+    the switch to a per-user data dir) so existing users keep their hotkeys,
+    calibration, layout, etc. Runs only when the new cache has no settings yet."""
+    legacy_cache = Path(__file__).resolve().parents[2] / "data" / "cache"
+    if not legacy_cache.is_dir() or any(CACHE_DIR.glob("*.json")):
+        return
+    for src in legacy_cache.glob("*.json"):
+        try:
+            shutil.copy2(src, CACHE_DIR / src.name)
+        except OSError:
+            pass
+
+
+_migrate_legacy_data()
 
 ITEMS_CACHE_FILE = CACHE_DIR / "items.json"
 PRICE_CACHE_FILE = CACHE_DIR / "prices.json"
@@ -27,6 +66,7 @@ HOTKEYS_FILE = CACHE_DIR / "hotkeys.json"
 MATCH_TOLERANCE_FILE = CACHE_DIR / "match_tolerance.json"
 COLOR_FILTER_FILE = CACHE_DIR / "color_filter.json"
 RELIC_FILE = CACHE_DIR / "relic.json"
+DISPLAY_FILE = CACHE_DIR / "display.json"
 LOG_FILE = LOGS_DIR / "app.log"
 SCAN_LOG_FILE = LOGS_DIR / "scans.txt"
 
@@ -35,15 +75,16 @@ SCAN_LOG_FILE = LOGS_DIR / "scans.txt"
 # These are the DEFAULTS; the user can rebind them in the Settings tab, which
 # persists overrides to hotkeys.json (loaded below). Stored in pynput's
 # GlobalHotKeys syntax so they can be handed straight to the listener.
-HOTKEY_SCAN = "<f9>"           # scan a box centered on the cursor (only while scan mode is on)
-HOTKEY_TOGGLE_SCAN = "<f10>"   # turn scan mode on / off
+HOTKEY_SCAN = "<f9>"           # trigger a scan / arm an area pick for the current mode
 HOTKEY_QUIT = "<ctrl>+<f10>"   # quit the app entirely
 HOTKEY_SEARCH = "<f8>"         # bring the window forward and open the manual item search
+HOTKEY_CLEAR = "<f7>"          # wipe all on-screen result/overlay labels (works any time)
+HOTKEY_DISPLAY = "<f6>"        # toggle the world-state Display HUD on / off
 
 
 def load_hotkeys() -> None:
     """Loads any rebindings from hotkeys.json over the defaults above."""
-    global HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH
+    global HOTKEY_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH, HOTKEY_CLEAR, HOTKEY_DISPLAY
     if not HOTKEYS_FILE.exists():
         return
     try:
@@ -51,16 +92,22 @@ def load_hotkeys() -> None:
     except (OSError, json.JSONDecodeError):
         return
     HOTKEY_SCAN = data.get("scan") or HOTKEY_SCAN
-    HOTKEY_TOGGLE_SCAN = data.get("toggle") or HOTKEY_TOGGLE_SCAN
     HOTKEY_QUIT = data.get("quit") or HOTKEY_QUIT
     HOTKEY_SEARCH = data.get("search") or HOTKEY_SEARCH
+    HOTKEY_CLEAR = data.get("clear") or HOTKEY_CLEAR
+    HOTKEY_DISPLAY = data.get("display") or HOTKEY_DISPLAY
 
 
-def save_hotkeys(scan: str, toggle: str, quit_: str, search: str) -> None:
-    global HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH
-    HOTKEY_SCAN, HOTKEY_TOGGLE_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH = scan, toggle, quit_, search
+def save_hotkeys(scan: str, quit_: str, search: str, clear: str, display: str) -> None:
+    global HOTKEY_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH, HOTKEY_CLEAR, HOTKEY_DISPLAY
+    HOTKEY_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH, HOTKEY_CLEAR, HOTKEY_DISPLAY = (
+        scan, quit_, search, clear, display,
+    )
     HOTKEYS_FILE.write_text(
-        json.dumps({"scan": scan, "toggle": toggle, "quit": quit_, "search": search}),
+        json.dumps({
+            "scan": scan, "quit": quit_, "search": search,
+            "clear": clear, "display": display,
+        }),
         encoding="utf-8",
     )
 
@@ -228,6 +275,69 @@ def save_selection_mode(mode: str) -> None:
 
 
 load_selection_mode()
+
+# --- World-state Display HUD --------------------------------------------
+# The Display tab shows live Warframe cycles (day/night, warm/cold, Fass/Vome)
+# as an on-screen overlay, pulled from the community Warframe Status API.
+WORLDSTATE_API_BASE = "https://api.warframestat.us"
+WORLDSTATE_PLATFORM = "pc"
+# How often the HUD re-fetches cycle data from the API while it's shown. The
+# countdown itself ticks locally every second (from each cycle's expiry), so
+# this only needs to catch a phase FLIP, not drive the clock.
+WORLDSTATE_REFRESH_SECONDS = 60
+
+# Which cycles are ticked to show, and where each card sits on screen. Both
+# persist to display.json. DISPLAY_ENABLED is a list of worldstate item keys
+# ("cetus", "earth", "vallis", "cambion"); DISPLAY_POSITIONS maps key -> [x, y]
+# screen coords (top-left of the card). Empty by default - nothing shows until
+# the user ticks something and positions it (a sensible default stack is used
+# for any ticked item without a saved position).
+DISPLAY_ENABLED: list[str] = []
+DISPLAY_POSITIONS: dict[str, list[int]] = {}
+
+
+def load_display() -> None:
+    global DISPLAY_ENABLED, DISPLAY_POSITIONS
+    if not DISPLAY_FILE.exists():
+        return
+    try:
+        data = json.loads(DISPLAY_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    enabled = data.get("enabled")
+    if isinstance(enabled, list):
+        DISPLAY_ENABLED = [str(k) for k in enabled]
+    positions = data.get("positions")
+    if isinstance(positions, dict):
+        cleaned: dict[str, list[int]] = {}
+        for key, xy in positions.items():
+            try:
+                cleaned[str(key)] = [int(xy[0]), int(xy[1])]
+            except (TypeError, ValueError, IndexError):
+                continue
+        DISPLAY_POSITIONS = cleaned
+
+
+def _write_display() -> None:
+    DISPLAY_FILE.write_text(
+        json.dumps({"enabled": DISPLAY_ENABLED, "positions": DISPLAY_POSITIONS}),
+        encoding="utf-8",
+    )
+
+
+def save_display_enabled(enabled: list[str]) -> None:
+    global DISPLAY_ENABLED
+    DISPLAY_ENABLED = [str(k) for k in enabled]
+    _write_display()
+
+
+def save_display_positions(positions: dict) -> None:
+    global DISPLAY_POSITIONS
+    DISPLAY_POSITIONS = {str(k): [int(v[0]), int(v[1])] for k, v in positions.items()}
+    _write_display()
+
+
+load_display()
 
 # --- warframe.market API --------------------------------------------------
 WFM_API_BASE = "https://api.warframe.market/v2"

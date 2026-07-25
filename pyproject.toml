@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wf-pricetracker"
+description = "A non-invasive Warframe inventory pricer that reads item names off the screen with OCR and prices them against warframe.market."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Ryyan Choudhary" }]
+keywords = ["warframe", "ocr", "warframe.market", "pricing", "overlay"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Environment :: X11 Applications",
+    "Topic :: Games/Entertainment",
+    "Intended Audience :: End Users/Desktop",
+]
+dynamic = ["version"]
+
+dependencies = [
+    "pillow>=10.0",
+    "easyocr>=1.7",
+    "pytesseract>=0.3.10",
+    "pynput>=1.7",
+    "pystray>=0.19",
+    "rapidfuzz>=3.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+build = ["pyinstaller>=6"]
+
+[project.scripts]
+wf-pricer = "wf_pricer.main:main"
+
+[project.urls]
+Homepage = "https://github.com/Ryyan-Choudhary/WF-PriceTracker"
+Repository = "https://github.com/Ryyan-Choudhary/WF-PriceTracker"
+Issues = "https://github.com/Ryyan-Choudhary/WF-PriceTracker/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "wf_pricer.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

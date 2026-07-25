@@ -217,17 +217,20 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# WF-PriceTracker runtime data (screenshots, output, caches, logs)
-data/captures/*
-data/output/*
-data/cache/*
-data/logs/*
-!data/captures/.gitkeep
-!data/output/.gitkeep
-!data/cache/.gitkeep
-!data/logs/.gitkeep
+# WF-PriceTracker runtime data now lives in a per-user data dir (see
+# config._user_data_dir), not in the repo. Ignore any legacy in-repo data/ dir
+# left over from an older checkout.
+/data/
 
-# API keys / secrets, in case one ever ends up outside data/cache/
+# Editor / agent scratch folders
+/.kilo/
+
+# Packaging / PyInstaller build artifacts (distribute via GitHub Releases, not git)
+/build/
+/dist/
+*.egg-info/
+
+# API keys / secrets, in case one ever ends up on disk
 *.key
 *api_key*
 secrets.json
