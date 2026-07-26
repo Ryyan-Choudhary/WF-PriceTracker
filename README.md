@@ -4,7 +4,9 @@ A non-invasive desktop companion that prices your Warframe inventory by
 **reading your screen with OCR** and looking each item up on **warframe.market**
 for you — no game files, memory, or network traffic touched.
 
-> **SCRN1** — _main window, Single tab (idle)_
+<p align="center">
+  <img src="assets/screenshots/main-window.png" alt="WF-PriceTracker main window" width="380">
+</p>
 
 &nbsp;
 
@@ -73,7 +75,6 @@ The software-development side of things, for the curious:
 | **Language** | Python 3.11 |
 | **GUI** | Tkinter / ttk (standard library), with a hand-rolled dark theme |
 | **Local OCR** | [Tesseract](https://github.com/tesseract-ocr/tesseract) (via `pytesseract`), [EasyOCR](https://github.com/JaidedAI/EasyOCR) (PyTorch deep-learning) |
-| **Cloud AI OCR** *(optional, in development)* | Claude Vision — Anthropic `claude-haiku-4-5`; Gemini Vision — Google `gemini-2.5-flash` |
 | **Image handling** | [Pillow](https://python-pillow.org/) |
 | **Fuzzy matching** | [RapidFuzz](https://github.com/maxbachmann/RapidFuzz) |
 | **Global hotkeys & mouse tracking** | [pynput](https://github.com/moses-palmer/pynput) |
@@ -86,42 +87,33 @@ The software-development side of things, for the curious:
 
 ## Features at a glance
 
-The window is organised into tabs — **Single**, **Multi-Select**, **Grid
-Scan**, and **Settings** — plus a magnifying-glass **search** button in the
-top-left. A tray icon (cyan diamond = idle, red = scan mode on) keeps it out of
-the way; closing the window with the X just hides it to the tray. Quit fully via
-the **Quit** button, the tray menu, or the quit hotkey (`Ctrl+F10` by default).
+The window is organised into tabs — **Multi-Select**, **Grid Scan**, **Relic
+Reward**, **Tracking**, and **Settings** — plus a magnifying-glass **search**
+button in the top-left. A tray icon (a cyan diamond) keeps it out of the way;
+closing the window with the X just hides it to the tray. Quit fully via the
+**Quit** button, the tray menu, or the quit hotkey (`Ctrl+F10` by default).
 
-### Single Item
-
-Hover one item in-game and press the scan hotkey (`F9` by default). The app
-grabs a fixed-size box centred on your cursor, OCRs it, matches it, and shows
-the price in a small popup right next to your cursor.
-
-- One-time setup: click **"Set Item Box Size…"** and drag a box around one
-  item's icon+name in-game. That's the size grabbed around your cursor on every
-  scan afterwards.
-- Each scan is one deliberate action covering exactly one item — no "more
-  prices than items" ambiguity.
-
-> **SCRN2** — _Single Item: the cursor target box, and the result popup_
-
-&nbsp;
+Each scan mode has its **own** hotkey (defaults `F9` Multi-Select, `F5` Grid,
+`F4` Relic), so pressing it scans in that mode directly — no need to switch tabs
+first.
 
 ### Multi-Select
 
-Price a whole shelf of items at once. Press **Select Area** (or the scan
-hotkey) to arm a **one-shot** selection, drag a box around however many items
-you want, and release. The entire region is captured, OCR'd for every item
-inside, and each one gets a **name + price label drawn directly over it on
-screen**, filled in one at a time as each is found and priced. Labels stay up
-until your next selection.
+Price a whole shelf of items at once. Press **Select Area** (or its hotkey,
+`F9`) to arm a **one-shot** selection, drag a box around however many items you
+want, and release. The entire region is captured, OCR'd for every item inside,
+and each one gets a **name + price label drawn directly over it on screen**,
+filled in one at a time as each is found and priced. Labels stay up until your
+next selection.
 
 It's deliberately one-shot: the app only takes over the mouse once you ask it
 to, and hands it straight back on release — so your clicks stay yours the rest
 of the time.
 
-> **SCRN3** — _Multi-Select: price labels drawn over a batch of items_
+<p align="center">
+  <img src="assets/screenshots/relic-region.png" alt="Multi-Select region drag" width="660">
+  <br><em>Drag a one-shot box around any batch of items.</em>
+</p>
 
 &nbsp;
 
@@ -143,7 +135,25 @@ its price.
   after every attempt are marked **Unreadable** (with the best text OCR
   managed), so "couldn't read this" is distinct from "empty slot".
 
-> **SCRN4** — _Grid Scan: the calibrated slot outline and priced slots_
+<p align="center">
+  <img src="assets/screenshots/grid-scan.png" alt="Grid Scan priced slots" width="900">
+  <br><em>Grid Scan: every calibrated slot labelled with its price (unreadable slots flagged, not guessed).</em>
+</p>
+
+&nbsp;
+
+### Relic Reward (Void Fissure reward screen)
+
+On the **Void Fissure reward-selection screen**, press the Relic hotkey (`F4` by
+default). The app reads the up-to-four reward names across the top, prices each,
+and **stars the most valuable** so you know what to pick before the timer runs
+out. The capture area is derived from the reward-screen layout scaled to your
+resolution — or calibrate it once on the **Relic** tab if your HUD scale differs.
+
+<p align="center">
+  <img src="assets/screenshots/relic-reward.png" alt="Relic reward pricing" width="900">
+  <br><em>Relic Reward: the four choices priced in place, the most valuable starred.</em>
+</p>
 
 &nbsp;
 
@@ -165,11 +175,44 @@ picture from warframe.market:
 - **48h volume** — how many traded in the last two days (best-effort).
 - **Sellers / Buyers online** — a live read on supply and demand.
 
-> **SCRN5** — _the quick-search bar with autocomplete suggestions_
+<p align="center">
+  <img src="assets/screenshots/quick-search.png" alt="Quick-search bar with autocomplete" width="360">
+  <br><em>The quick-search bar with live autocomplete.</em>
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/item-stats.png" alt="Item stats popup" width="320">
+  <br><em>The stats popup — a ranked arcane, split into per-rank prices.</em>
+</p>
 
 &nbsp;
 
-> **SCRN6** — _the item stats popup (a ranked arcane, showing per-rank prices)_
+### Tracking — live world-state HUD
+
+The **Tracking** tab drives a click-through overlay of live Warframe timers you
+can drag anywhere on screen and toggle with a hotkey (`F6` by default). Tick
+what you want and press **Show / Hide**:
+
+- **Location cycles** — Cetus & Earth day/night, Orb Vallis warm/cold, Deimos
+  Fass/Vome, Duviri Spiral.
+- **Archon Hunt** — the weekly boss and its **Archon Shard** drop.
+- **1999 Calendar** — the active season plus **today's event** (its type, name
+  and objective).
+- **Daily / Weekly reset** timers — computed locally, so they keep counting even
+  if the world-state API is down.
+
+**Edit Layout** lets you drag each card where you want it; positions are saved.
+The overlay is click-through, so it never eats a click while you play.
+
+<p align="center">
+  <img src="assets/screenshots/tracking-hud.png" alt="Tracking HUD over the game" width="900">
+  <br><em>The Tracking HUD over the game — cycles, Archon Hunt (+shard), the 1999 calendar, and reset timers.</em>
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/tracking-tab.png" alt="Tracking tab checklist" width="900">
+  <br><em>The Tracking tab: tick the cards you want, then Show / Hide or Edit Layout.</em>
+</p>
 
 &nbsp;
 
@@ -181,7 +224,9 @@ Everything configurable lives on the **Settings** tab, grouped into sections.
 Changes are saved under your per-user data folder
 (`%LOCALAPPDATA%\WF-PriceTracker\cache` on Windows) and persist across restarts.
 
-> **SCRN7** — _the Settings tab_
+<p align="center">
+  <img src="assets/screenshots/settings.png" alt="Settings tab" width="820">
+</p>
 
 &nbsp;
 
@@ -211,25 +256,35 @@ Changes are saved under your per-user data folder
 
 ### Hotkeys
 
-All four hotkeys are **rebindable** — click **"Change…"** and press the key or
-combo you want. Defaults:
+Every hotkey is **rebindable** — click **"Change…"** and press the key or
+combo you want. Each scan mode has its **own** key, so it fires that mode
+directly no matter which tab is open — no need to switch modes first. Defaults:
 
 | Action | Default | What it does |
 |--------|---------|--------------|
-| Toggle scan mode | `F10` | Turn scan mode on/off |
-| Scan now | `F9` | Scan at cursor (Single) / scan the grid (Grid) |
+| Scan · Multi-Select | `F9` | Arm a one-shot area pick, then price everything in it |
+| Scan · Grid | `F5` | OCR and price every calibrated inventory slot |
+| Scan · Relic | `F4` | Read and price the Void Fissure reward names |
 | Open search | `F8` | Pop the quick-search bar |
+| Clear overlays | `F7` | Wipe every on-screen price label / outline |
+| Toggle tracking | `F6` | Show/hide the world-state HUD |
 | Quit app | `Ctrl+F10` | Quit entirely |
 
 The current **search** binding is also shown right next to the magnifier icon
 in the header, so the shortcut stays discoverable.
 
-### Catalog & API keys
+### Text colour filter
+
+- **Only read text of a chosen colour** — restrict OCR to your UI theme's text
+  colour so it cuts through Warframe's animated card art. Set it with the
+  on-screen **eyedropper** (freeze the screen, magnify, click a pixel) or a
+  colour picker. Leave it off unless the colour matches — a wrong colour hides
+  the real text.
+
+### Catalog
 
 - **Refresh Item List** — force an immediate refetch of the warframe.market item
   catalog (e.g. right after a new item drops), bypassing the 3-day cache.
-- **Anthropic Key… / Google Key…** — for the cloud AI OCR engines. *Greyed out
-  while those engines are in development* (see below).
 
 ---
 
@@ -380,7 +435,8 @@ src/wf_pricer/
   market.py     warframe.market order fetch/cache (thread-safe), concurrent pricing,
                 per-item stats (order book, per-rank tiers, 48h volume)
   pipeline.py   price_region (multi) / price_relic (relic) / price_grid (grid)
-  worldstate.py live Warframe cycles for the Tracking HUD (warframestat.us)
+  worldstate.py Tracking HUD data: live cycles, Archon Hunt, 1999 calendar
+                (warframestat.us) + daily/weekly reset timers (computed locally)
   glyphs.py     emoji icons rendered to images for the HUD
   gui.py        tabbed window, dark theme, overlays, quick-search + stats popups
   tray.py       tray icon image

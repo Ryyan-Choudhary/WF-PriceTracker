@@ -4,4 +4,4 @@ Reads item names off the screen with OCR and prices them against
 warframe.market. See wf_pricer.main for the entry point.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

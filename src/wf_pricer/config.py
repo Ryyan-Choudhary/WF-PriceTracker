@@ -71,43 +71,60 @@ LOG_FILE = LOGS_DIR / "app.log"
 SCAN_LOG_FILE = LOGS_DIR / "scans.txt"
 
 # --- Hotkeys (pynput <...> syntax) --------------------------------------
-# Chosen because Warframe doesn't use F9/F10 for anything by default.
+# Chosen because Warframe doesn't use these F-keys for anything by default.
 # These are the DEFAULTS; the user can rebind them in the Settings tab, which
 # persists overrides to hotkeys.json (loaded below). Stored in pynput's
 # GlobalHotKeys syntax so they can be handed straight to the listener.
-HOTKEY_SCAN = "<f9>"           # trigger a scan / arm an area pick for the current mode
+#
+# Each scan mode has its OWN key: pressing it scans in that mode directly, no
+# matter which tab is open, so there's no mode to switch to first.
+HOTKEY_SCAN_MULTI = "<f9>"     # Multi-Select: arm a one-shot area pick, then scan it
+HOTKEY_SCAN_GRID = "<f5>"      # Grid: OCR every calibrated slot's name band
+HOTKEY_SCAN_RELIC = "<f4>"     # Relic: read the Void Fissure reward names
 HOTKEY_QUIT = "<ctrl>+<f10>"   # quit the app entirely
 HOTKEY_SEARCH = "<f8>"         # bring the window forward and open the manual item search
 HOTKEY_CLEAR = "<f7>"          # wipe all on-screen result/overlay labels (works any time)
 HOTKEY_DISPLAY = "<f6>"        # toggle the world-state Display HUD on / off
 
+# The rebindable actions, in the order they appear in the Settings tab.
+HOTKEY_ACTIONS = ("scan_multi", "scan_grid", "scan_relic", "search", "clear", "display", "quit")
+
 
 def load_hotkeys() -> None:
     """Loads any rebindings from hotkeys.json over the defaults above."""
-    global HOTKEY_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH, HOTKEY_CLEAR, HOTKEY_DISPLAY
+    global HOTKEY_SCAN_MULTI, HOTKEY_SCAN_GRID, HOTKEY_SCAN_RELIC
+    global HOTKEY_QUIT, HOTKEY_SEARCH, HOTKEY_CLEAR, HOTKEY_DISPLAY
     if not HOTKEYS_FILE.exists():
         return
     try:
         data = json.loads(HOTKEYS_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return
-    HOTKEY_SCAN = data.get("scan") or HOTKEY_SCAN
+    # "scan" is the pre-split single scan key; fold any old rebind of it into
+    # Multi-Select so upgrading users don't silently lose their binding.
+    HOTKEY_SCAN_MULTI = data.get("scan_multi") or data.get("scan") or HOTKEY_SCAN_MULTI
+    HOTKEY_SCAN_GRID = data.get("scan_grid") or HOTKEY_SCAN_GRID
+    HOTKEY_SCAN_RELIC = data.get("scan_relic") or HOTKEY_SCAN_RELIC
     HOTKEY_QUIT = data.get("quit") or HOTKEY_QUIT
     HOTKEY_SEARCH = data.get("search") or HOTKEY_SEARCH
     HOTKEY_CLEAR = data.get("clear") or HOTKEY_CLEAR
     HOTKEY_DISPLAY = data.get("display") or HOTKEY_DISPLAY
 
 
-def save_hotkeys(scan: str, quit_: str, search: str, clear: str, display: str) -> None:
-    global HOTKEY_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH, HOTKEY_CLEAR, HOTKEY_DISPLAY
-    HOTKEY_SCAN, HOTKEY_QUIT, HOTKEY_SEARCH, HOTKEY_CLEAR, HOTKEY_DISPLAY = (
-        scan, quit_, search, clear, display,
-    )
+def save_hotkeys(bindings: dict) -> None:
+    """Persist every hotkey binding and update the live globals. `bindings` maps
+    each action name in HOTKEY_ACTIONS to a pynput GlobalHotKeys string."""
+    global HOTKEY_SCAN_MULTI, HOTKEY_SCAN_GRID, HOTKEY_SCAN_RELIC
+    global HOTKEY_QUIT, HOTKEY_SEARCH, HOTKEY_CLEAR, HOTKEY_DISPLAY
+    HOTKEY_SCAN_MULTI = bindings["scan_multi"]
+    HOTKEY_SCAN_GRID = bindings["scan_grid"]
+    HOTKEY_SCAN_RELIC = bindings["scan_relic"]
+    HOTKEY_QUIT = bindings["quit"]
+    HOTKEY_SEARCH = bindings["search"]
+    HOTKEY_CLEAR = bindings["clear"]
+    HOTKEY_DISPLAY = bindings["display"]
     HOTKEYS_FILE.write_text(
-        json.dumps({
-            "scan": scan, "quit": quit_, "search": search,
-            "clear": clear, "display": display,
-        }),
+        json.dumps({action: bindings[action] for action in HOTKEY_ACTIONS}),
         encoding="utf-8",
     )
 
@@ -281,9 +298,11 @@ load_selection_mode()
 # as an on-screen overlay, pulled from the community Warframe Status API.
 WORLDSTATE_API_BASE = "https://api.warframestat.us"
 WORLDSTATE_PLATFORM = "pc"
-# How often the HUD re-fetches cycle data from the API while it's shown. The
-# countdown itself ticks locally every second (from each cycle's expiry), so
-# this only needs to catch a phase FLIP, not drive the clock.
+# The MAX interval between HUD re-fetches while it's shown. The countdown ticks
+# locally every second (from each cycle's expiry), so a refresh only needs to
+# catch a phase FLIP, not drive the clock. The worker also refreshes early, just
+# as the soonest countdown lapses, so a flipped cycle / reset timer rolls
+# straight over instead of sticking at 0:00 (see App._next_refresh_delay).
 WORLDSTATE_REFRESH_SECONDS = 60
 
 # Which cycles are ticked to show, and where each card sits on screen. Both

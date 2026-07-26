@@ -120,23 +120,51 @@ class App:
 
     # --- hotkey / button callbacks --------------------------------------
     def on_scan(self) -> None:
-        # The scan hotkey (and the window's single action button) does whatever
-        # the current selection mode needs, on demand - there's no separate
-        # "scan mode" to arm first.
+        # The window's single action button scans in whatever mode the tabs are
+        # currently on. (Each scan mode also has its own dedicated hotkey below,
+        # which fires that mode regardless of the active tab.)
         if self._capturing_hotkey:
             return
-        if self.selection_mode == "grid":
+        self._scan_in_mode(self.selection_mode)
+
+    def on_scan_multi(self) -> None:
+        if self._capturing_hotkey:
+            return
+        self._scan_in_mode("multi")
+
+    def on_scan_grid(self) -> None:
+        if self._capturing_hotkey:
+            return
+        self._scan_in_mode("grid")
+
+    def on_scan_relic(self) -> None:
+        if self._capturing_hotkey:
+            return
+        self._scan_in_mode("relic")
+
+    def _scan_in_mode(self, mode: str) -> None:
+        """Run one scan in `mode` on demand. Called from the per-mode hotkeys
+        (any time) and the window's action button (for the current mode)."""
+        if mode == "grid":
             if config.GRID is None:
                 if self.window:
                     self.window.log('Calibrate the grid first ("Calibrate Grid..." button).')
                 return
             threading.Thread(target=self._grid_scan_worker, daemon=True).start()
             return
-        if self.selection_mode == "relic":
+        if mode == "relic":
             threading.Thread(target=self._relic_scan_worker, daemon=True).start()
             return
         # Multi-Select: arm a one-shot region pick, then scan it.
         self.start_multi_select()
+
+    def _current_scan_hotkey(self) -> str:
+        """The scan hotkey for the mode the tabs are on - what the tray's
+        'Scan now' item (which acts on the current mode) will trigger."""
+        return {
+            "grid": config.HOTKEY_SCAN_GRID,
+            "relic": config.HOTKEY_SCAN_RELIC,
+        }.get(self.selection_mode, config.HOTKEY_SCAN_MULTI)
 
     _MODE_NAMES = {
         "multi": "Multi-Select", "grid": "Grid Scan", "relic": "Relic Reward",
@@ -284,10 +312,13 @@ class App:
             self.window.log("Tracking off.")
 
     def _display_worker(self, stop: threading.Event) -> None:
-        """Refresh cycle data every WORLDSTATE_REFRESH_SECONDS while the HUD is
-        up. The overlay ticks the countdown locally each second; this only needs
-        to catch a phase flip and the initial load. Reads self.display_enabled
-        fresh each pass so ticking a checkbox is picked up without a restart."""
+        """Refresh cycle data while the HUD is up. The overlay ticks the
+        countdown locally each second; this catches phase flips and the initial
+        load. Reads self.display_enabled fresh each pass so ticking a checkbox is
+        picked up without a restart. The wait between refreshes is normally the
+        full interval, but shrinks so we wake right as the soonest countdown
+        lapses - otherwise a flipped cycle (or a reset timer) can sit at 0:00
+        for up to a whole interval until the next refresh."""
         while not stop.is_set():
             keys = list(self.display_enabled)
             states = worldstate.fetch_states(keys)
@@ -296,8 +327,38 @@ class App:
             if self.window:
                 self.window.update_display_data(states)
                 offline = (not states) or any(not s.ok for s in states.values())
-                self.window.set_display_status("On (offline?)" if offline else "On")
-            stop.wait(config.WORLDSTATE_REFRESH_SECONDS)
+                if offline:
+                    # Distinguish "warframestat itself is down" from "warframestat
+                    # is up but the game's worldstate feed is unavailable" via the
+                    # /heartbeat health check - so the status says whose problem it is.
+                    status = "On (feed down)" if worldstate.api_heartbeat() else "On (API unreachable)"
+                else:
+                    status = "On"
+                self.window.set_display_status(status)
+            stop.wait(self._next_refresh_delay(states))
+
+    def _next_refresh_delay(self, states: dict) -> float:
+        """Seconds to wait before the next Tracking refresh: the full interval,
+        capped so we wake just after the soonest card's countdown runs out (so
+        it rolls straight to its next value instead of sticking at 0:00). If a
+        card has already lapsed, re-check soon rather than hammer the API."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        delay = float(config.WORLDSTATE_REFRESH_SECONDS)
+        soonest_future = None
+        has_lapsed = False
+        for state in states.values():
+            if state.expiry is None:
+                continue
+            secs = (state.expiry - now).total_seconds()
+            if secs <= 0:
+                has_lapsed = True
+            elif soonest_future is None or secs < soonest_future:
+                soonest_future = secs
+        if soonest_future is not None:
+            delay = min(delay, soonest_future + 1.0)
+        if has_lapsed:
+            delay = min(delay, 10.0)
+        return max(2.0, delay)  # floor: never spin faster than this
 
     def set_display_item(self, key: str, enabled: bool) -> None:
         chosen = set(self.display_enabled)
@@ -343,7 +404,8 @@ class App:
 
     # --- hotkeys ---------------------------------------------------------
     _HK_ACTION_LABELS = {
-        "scan": "Scan now", "search": "Open search",
+        "scan_multi": "Scan (Multi-Select)", "scan_grid": "Scan (Grid)",
+        "scan_relic": "Scan (Relic)", "search": "Open search",
         "clear": "Clear overlays", "display": "Toggle tracking", "quit": "Quit",
     }
 
@@ -370,7 +432,9 @@ class App:
             return
 
         current = {
-            "scan": config.HOTKEY_SCAN,
+            "scan_multi": config.HOTKEY_SCAN_MULTI,
+            "scan_grid": config.HOTKEY_SCAN_GRID,
+            "scan_relic": config.HOTKEY_SCAN_RELIC,
             "quit": config.HOTKEY_QUIT,
             "search": config.HOTKEY_SEARCH,
             "clear": config.HOTKEY_CLEAR,
@@ -386,10 +450,7 @@ class App:
                 return
 
         current[action] = hotkey
-        config.save_hotkeys(
-            scan=current["scan"], quit_=current["quit"],
-            search=current["search"], clear=current["clear"], display=current["display"],
-        )
+        config.save_hotkeys(current)
         if self.hotkeys is not None:
             try:
                 self.hotkeys.restart()
@@ -688,7 +749,7 @@ class App:
         menu = pystray.Menu(
             pystray.MenuItem("Show window", lambda: self.show_window(), default=True),
             pystray.MenuItem(
-                lambda _i: f"Scan now ({gui.hotkey_label(config.HOTKEY_SCAN)})",
+                lambda _i: f"Scan now ({gui.hotkey_label(self._current_scan_hotkey())})",
                 lambda: self.on_scan(),
             ),
             pystray.MenuItem(
@@ -754,7 +815,8 @@ def main() -> None:
         window.log("(First EasyOCR run will download its model weights - needs internet, one-time.)")
 
     hotkeys = scan.HotkeyListener(
-        on_scan=app.on_scan, on_quit=app.on_quit,
+        on_scan_multi=app.on_scan_multi, on_scan_grid=app.on_scan_grid,
+        on_scan_relic=app.on_scan_relic, on_quit=app.on_quit,
         on_search=app.open_search, on_clear=app.on_clear_overlays,
         on_display=app.on_display_toggle,
     )

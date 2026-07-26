@@ -160,13 +160,17 @@ class HotkeyListener:
 
     def __init__(
         self,
-        on_scan: Callable[[], None],
+        on_scan_multi: Callable[[], None],
+        on_scan_grid: Callable[[], None],
+        on_scan_relic: Callable[[], None],
         on_quit: Callable[[], None],
         on_search: Callable[[], None],
         on_clear: Callable[[], None],
         on_display: Callable[[], None],
     ) -> None:
-        self._on_scan = on_scan
+        self._on_scan_multi = on_scan_multi
+        self._on_scan_grid = on_scan_grid
+        self._on_scan_relic = on_scan_relic
         self._on_quit = on_quit
         self._on_search = on_search
         self._on_clear = on_clear
@@ -180,7 +184,9 @@ class HotkeyListener:
         # can't be restarted), so restart() always constructs a fresh one.
         self._listener = keyboard.GlobalHotKeys(
             {
-                config.HOTKEY_SCAN: self._on_scan,
+                config.HOTKEY_SCAN_MULTI: self._on_scan_multi,
+                config.HOTKEY_SCAN_GRID: self._on_scan_grid,
+                config.HOTKEY_SCAN_RELIC: self._on_scan_relic,
                 config.HOTKEY_QUIT: self._on_quit,
                 config.HOTKEY_SEARCH: self._on_search,
                 config.HOTKEY_CLEAR: self._on_clear,

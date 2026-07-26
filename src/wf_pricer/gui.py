@@ -216,7 +216,9 @@ class AppWindow:
         # Hotkey display state (see set_hotkey_labels). Seeded from config so
         # the labels are right on first paint, before main pushes anything.
         self._hk_labels = {
-            "scan": hotkey_label(config.HOTKEY_SCAN),
+            "scan_multi": hotkey_label(config.HOTKEY_SCAN_MULTI),
+            "scan_grid": hotkey_label(config.HOTKEY_SCAN_GRID),
+            "scan_relic": hotkey_label(config.HOTKEY_SCAN_RELIC),
             "quit": hotkey_label(config.HOTKEY_QUIT),
             "search": hotkey_label(config.HOTKEY_SEARCH),
             "clear": hotkey_label(config.HOTKEY_CLEAR),
@@ -805,10 +807,10 @@ class AppWindow:
 
     def _build_display_panel(self) -> tk.Frame:
         card, body = self._panel_body(
-            "Tick the world-state cycles you want on screen, then press the Tracking "
-            "hotkey (or Show / Hide) to toggle them over the game. Use Edit Layout to "
-            "drag each card where you want it — positions are saved. The overlay is "
-            "click-through, so it never gets in the way of playing."
+            "Tick the world-state cycles, timers and events you want on screen, then "
+            "press the Tracking hotkey (or Show / Hide) to toggle them over the game. "
+            "Use Edit Layout to drag each card where you want it — positions are saved. "
+            "The overlay is click-through, so it never gets in the way of playing."
         )
         for key in worldstate.DISPLAY_ITEM_ORDER:
             var = tk.BooleanVar(value=key in config.DISPLAY_ENABLED)
@@ -852,14 +854,25 @@ class AppWindow:
             side="left", expand=True, fill="x",
         )
 
+    def _mode_hotkey_label(self, mode: str) -> str:
+        """Pretty label of the scan hotkey bound to `mode` (each mode has its
+        own key)."""
+        return {
+            "grid": self._hk_labels["scan_grid"],
+            "relic": self._hk_labels["scan_relic"],
+        }.get(mode, self._hk_labels["scan_multi"])
+
     def _scan_btn_text(self) -> str:
         # In Multi-Select the action arms a one-shot area pick rather than
-        # scanning immediately, so the button says what it actually does.
-        verb = "Select Area" if self.selection_mode_var.get() == "multi" else "Scan Now"
-        return f"{verb} ({self._hk_labels['scan']})"
+        # scanning immediately, so the button says what it actually does. The
+        # shortcut shown is the current mode's own scan key.
+        mode = self.selection_mode_var.get()
+        verb = "Select Area" if mode == "multi" else "Scan Now"
+        return f"{verb} ({self._mode_hotkey_label(mode)})"
 
     _HK_ACTION_NAMES = {
-        "scan": "Scan now", "search": "Open search",
+        "scan_multi": "Scan · Multi-Select", "scan_grid": "Scan · Grid",
+        "scan_relic": "Scan · Relic", "search": "Open search",
         "clear": "Clear overlays", "display": "Toggle tracking", "quit": "Quit app",
     }
 
@@ -980,7 +993,7 @@ class AppWindow:
 
         # --- Hotkeys ---
         self._settings_subhead(body, "Hotkeys")
-        for action in ("scan", "search", "clear", "display", "quit"):
+        for action in config.HOTKEY_ACTIONS:
             self._hotkey_row(body, action)
 
         # --- Catalog ---
@@ -1112,12 +1125,13 @@ class AppWindow:
         """The status pill, action button and footer hint follow the active
         SCAN MODE (not the visible tab), so they stay correct while the Settings
         tab is open."""
+        key = self._mode_hotkey_label(mode)
         if mode == "grid":
-            action = f"{self._hk_labels['scan']} scan grid"
+            action = f"{key} scan grid"
         elif mode == "relic":
-            action = f"{self._hk_labels['scan']} scan rewards"
+            action = f"{key} scan rewards"
         else:  # multi
-            action = f"{self._hk_labels['scan']} select area"
+            action = f"{key} select area"
         self.status_var.set(self._MODE_STATUS.get(mode, "Ready"))
         self.scan_now_btn.config(text=self._scan_btn_text())
         self.hint_var.set(
@@ -1325,10 +1339,9 @@ class AppWindow:
         self.call_soon(lambda: self.grid_info_var.set(text))
 
     def set_hotkey_labels(self, labels: dict) -> None:
-        """Update the shown hotkey bindings (a dict of any of scan/search/clear/
-        quit -> pretty label) after a rebind, and refresh everything derived
-        from them: the settings rows, the action button, the footer hint.
-        Thread-safe.
+        """Update the shown hotkey bindings (a dict of any HOTKEY_ACTIONS key ->
+        pretty label) after a rebind, and refresh everything derived from them:
+        the settings rows, the action button, the footer hint. Thread-safe.
         """
 
         def _set() -> None:
@@ -2351,7 +2364,8 @@ class WorldStateOverlay(tk.Toplevel):
 
     _TRANSPARENT_KEY = "#010203"
     _CARD_W = 186
-    _CARD_H = 56
+    _CARD_H = 56          # two-line card (title + phase·countdown)
+    _DETAIL_LINE_H = 14   # height added per optional detail line (shard, calendar events)
     _ICON = 40
 
     def __init__(self, parent: tk.Misc, on_layout_saved: Callable[[dict], None]) -> None:
@@ -2436,14 +2450,28 @@ class WorldStateOverlay(tk.Toplevel):
             self._tick_job = None
 
     # --- drawing ----------------------------------------------------------
+    def _card_height(self, key: str) -> int:
+        """Cards with detail lines (Archon shard; today's calendar rewards +
+        mission + objective) grow one line taller per detail line than the plain
+        two-line cycle/timer cards."""
+        state = self._states.get(key)
+        n = len(state.detail) if state and state.detail else 0
+        return self._CARD_H + n * self._DETAIL_LINE_H
+
     def _pos(self, key: str) -> tuple[int, int]:
         """Screen position of a card: the saved one, or a default vertical
-        stack near the top-left for a ticked item that's never been placed."""
+        stack near the top-left for a ticked item that's never been placed.
+        The stack accumulates each card's own height so taller cards don't
+        overlap the next."""
         if key in self._positions:
             return self._positions[key]
-        idx = self._enabled.index(key) if key in self._enabled else 0
         left, top, _w, _h = virtual_screen_rect()
-        return (left + 40, top + 40 + idx * (self._CARD_H + 12))
+        y = top + 40
+        for k in self._enabled:
+            if k == key:
+                break
+            y += self._card_height(k) + 12
+        return (left + 40, y)
 
     def _icon_photo(self, icon: str):
         cache_key = (icon, self._ICON)
@@ -2478,8 +2506,9 @@ class WorldStateOverlay(tk.Toplevel):
         icon = state.icon if state else "⏳"  # ⏳ while loading
         phase = state.phase_label if state else "…"
         remaining = worldstate.format_remaining(state.expiry) if state else "…"
+        detail = state.detail if state else []
 
-        w, h = self._CARD_W, self._CARD_H
+        w, h = self._CARD_W, self._card_height(key)
         outline = ACCENT if self._edit else BORDER
         self.canvas.create_rectangle(
             x, y, x + w, y + h, fill=SURFACE, outline=outline,
@@ -2488,9 +2517,21 @@ class WorldStateOverlay(tk.Toplevel):
         self.canvas.create_image(x + 8, y + h // 2, anchor="w", image=self._icon_photo(icon))
         tx = x + 8 + self._ICON + 8
         self.canvas.create_text(tx, y + 15, anchor="w", text=place, fill=ACCENT, font=(FONT, 11, "bold"))
+        # Reset timers carry no phase label - they show just the countdown.
+        second_line = f"{phase}  ·  {remaining}" if phase else remaining
         self.canvas.create_text(
-            tx, y + 37, anchor="w", text=f"{phase}  ·  {remaining}", fill=TEXT, font=(FONT, 10)
+            tx, y + 37, anchor="w", text=second_line, fill=TEXT, font=(FONT, 10)
         )
+        # Optional detail lines under the countdown: the Archon shard drop, or
+        # today's calendar events. Each is (text, is_header); a header (the event
+        # type) is drawn in accent, its content indented and dimmed.
+        dy = y + 54
+        for text, is_header in detail:
+            if is_header:
+                self.canvas.create_text(tx, dy, anchor="w", text=text, fill=ACCENT, font=(FONT, 8, "bold"))
+            else:
+                self.canvas.create_text(tx + 8, dy, anchor="w", text=text, fill=TEXT_DIM, font=(FONT, 8))
+            dy += self._DETAIL_LINE_H
         self._card_boxes[key] = (x, y, x + w, y + h)
 
     # --- edit-layout mode -------------------------------------------------
