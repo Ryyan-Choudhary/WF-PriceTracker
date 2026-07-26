@@ -81,6 +81,7 @@ The software-development side of things, for the curious:
 | **System tray** | [pystray](https://github.com/moses-palmer/pystray) |
 | **HTTP** | [requests](https://requests.readthedocs.io/) |
 | **Market data** | the [warframe.market API](https://warframe.market/) — v2 orders endpoint for live prices, v1 statistics endpoint (best-effort) for 48-hour trade volume |
+| **World-state data** | the [Warframe Status API](https://docs.warframestat.us/) (community, warframestat.us) — live world cycles, Archon Hunt and the 1999 Calendar for the Tracking HUD, plus `/heartbeat` for a live up/down status |
 | **Windows integration** | `ctypes` for DPI awareness, screen metrics, and foreground-focus handling |
 
 ---
