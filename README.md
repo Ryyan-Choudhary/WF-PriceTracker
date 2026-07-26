@@ -117,7 +117,7 @@ of the time.
 
 &nbsp;
 
-### Grid Scan (WFInfo-style — most accurate on a full inventory page)
+### Grid Scan (Most accurate on a full inventory page)
 
 Calibrate a fixed grid of inventory slots once (box the first and last slot's
 name text, enter the rows/columns), then press the scan hotkey with your
